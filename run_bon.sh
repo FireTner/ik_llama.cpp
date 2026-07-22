@@ -58,6 +58,9 @@ fi
 echo "==> Launching llama-server with hardware optimizations..."
 
 # Was: -b 2048 -ub 2048 — cut batch only; keep 64k for Hermes.
+# -khad/-vhad: Hadamard before q4 KV (better quality @ same VRAM; ik TurboQuant alt).
+# Was: --ctx-checkpoints 0 — killed hybrid restore; Hermès re-PP'd ~20k every tool turn.
+# Now 32: recurrent/SSM checkpoints so multi-turn can resume (see docs/parameters.md).
 # If OOM without UVM: try -c 8192 briefly to confirm GPU residency, then raise.
 ./build/bin/llama-server \
     -m "$MODEL_PATH" \
@@ -68,7 +71,9 @@ echo "==> Launching llama-server with hardware optimizations..."
     -fa on \
     --cache-type-k q4_0 \
     --cache-type-v q4_0 \
-    --ctx-checkpoints 0 \
+    -khad \
+    -vhad \
+    --ctx-checkpoints 32 \
     --graph-reuse \
     --jinja \
     -t 6 \
