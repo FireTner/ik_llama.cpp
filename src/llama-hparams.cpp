@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-model.h"
 
+#include <cmath>
 #include <limits>
 #include <map>
 
@@ -99,6 +100,75 @@ static bool load_dflash_target_layer_ids(
     }
 
     return true;
+}
+
+static bool load_dspark_target_layers(
+        llama_model_loader & ml,
+        const std::string & key,
+        llama_hparams & hparams,
+        bool required) {
+    const int kid = gguf_find_key(ml.meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(ml.meta, kid) != GGUF_TYPE_ARRAY) {
+        if (required) {
+            throw std::runtime_error(format("array key not found in model: %s", key.c_str()));
+        }
+        return false;
+    }
+
+    const enum gguf_type type = gguf_get_arr_type(ml.meta, kid);
+    if (type != GGUF_TYPE_UINT32 && type != GGUF_TYPE_INT32) {
+        throw std::runtime_error(format("dspark: %s must be a uint32/int32 array", key.c_str()));
+    }
+
+    uint32_t n = 0;
+    ml.get_arr_n(key, n, true);
+    if (n == 0) {
+        throw std::runtime_error(format("dspark: %s must not be empty", key.c_str()));
+    }
+    if (n > 8) {
+        throw std::runtime_error(format("dspark: %s has %u entries, max is 8", key.c_str(), n));
+    }
+
+    hparams.n_dspark_target_layers = n;
+    for (uint32_t & id : hparams.dspark_target_layers) {
+        id = 0;
+    }
+
+    if (type == GGUF_TYPE_INT32) {
+        std::array<int32_t, 8> layer_ids = {};
+        ml.get_arr(key, layer_ids, true);
+        for (uint32_t i = 0; i < hparams.n_dspark_target_layers; ++i) {
+            if (layer_ids[i] < 0) {
+                throw std::runtime_error(format("dspark: %s contains negative layer id %d", key.c_str(), layer_ids[i]));
+            }
+            hparams.dspark_target_layers[i] = (uint32_t) layer_ids[i];
+        }
+    } else {
+        std::array<uint32_t, 8> layer_ids = {};
+        ml.get_arr(key, layer_ids, true);
+        for (uint32_t i = 0; i < hparams.n_dspark_target_layers; ++i) {
+            hparams.dspark_target_layers[i] = layer_ids[i];
+        }
+    }
+
+    return true;
+}
+
+static void validate_dspark_hparams(llama_hparams & hparams, llm_arch arch) {
+    if (hparams.dspark_block_size <= 1) {
+        throw std::runtime_error(format("%s: dspark block_size must be > 1", llama_model_arch_name(arch)));
+    }
+    if (hparams.n_dspark_target_layers == 0) {
+        throw std::runtime_error(format("%s: dspark target_layers are required", llama_model_arch_name(arch)));
+    }
+    if (hparams.dspark_log_snr_conditioning) {
+        if (!std::isfinite(hparams.dspark_min_log_snr) || !std::isfinite(hparams.dspark_max_log_snr)) {
+            throw std::runtime_error(format("%s: dspark log-SNR conditioning: min/max_log_snr must be finite", llama_model_arch_name(arch)));
+        }
+        if (!(hparams.dspark_max_log_snr > hparams.dspark_min_log_snr)) {
+            throw std::runtime_error(format("%s: dspark log-SNR conditioning: max_log_snr must be greater than min_log_snr", llama_model_arch_name(arch)));
+        }
+    }
 }
 
 static void validate_dflash_hparams(llama_hparams & hparams, llm_arch arch) {
@@ -911,6 +981,35 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
                 ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
                 validate_dflash_hparams(hparams, model.arch);
+
+                hparams.n_layer_kv_from_start = hparams.n_layer;
+                model.type = e_model::MODEL_UNKNOWN;
+            } break;
+
+        case LLM_ARCH_DSPARK:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE,   hparams.dspark_block_size, true);
+                ml.get_key(LLM_KV_DSPARK_MASK_TOKEN_ID, hparams.dspark_mask_token_id, true);
+                ml.get_key(LLM_KV_DSPARK_MARKOV_RANK,  hparams.dspark_markov_rank, false);
+                ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD, hparams.dspark_confidence_head, false);
+                ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD_WITH_MARKOV, hparams.dspark_confidence_head_with_markov, false);
+
+                // GIDD log-SNR conditioning: optional metadata, absent (and defaulted off) on
+                // drafters not trained with it. When enabled the bounds are required and drive a
+                // divide in the featurization, so they must be present, finite, and strictly ordered.
+                ml.get_key(LLM_KV_DSPARK_LOG_SNR_CONDITIONING, hparams.dspark_log_snr_conditioning, false);
+                if (hparams.dspark_log_snr_conditioning) {
+                    ml.get_key(LLM_KV_DSPARK_MIN_LOG_SNR, hparams.dspark_min_log_snr, true);
+                    ml.get_key(LLM_KV_DSPARK_MAX_LOG_SNR, hparams.dspark_max_log_snr, true);
+                }
+
+                // ordered set of TARGET-model layer indices this drafter taps (indexes into the
+                // target's layer count, not this drafter's own tiny n_layer).
+                load_dspark_target_layers(ml, LLM_KV(model.arch)(LLM_KV_DSPARK_TARGET_LAYERS), hparams, true);
+
+                validate_dspark_hparams(hparams, model.arch);
 
                 hparams.n_layer_kv_from_start = hparams.n_layer;
                 model.type = e_model::MODEL_UNKNOWN;

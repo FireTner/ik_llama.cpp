@@ -31,6 +31,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_DFLASH,
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
     COMMON_SPECULATIVE_TYPE_MTP,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
@@ -45,6 +46,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
+    {"draft_dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}, // also matches "draft-dspark" (- normalized to _)
     {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -189,11 +191,14 @@ struct common_speculative_state {
 
 struct common_speculative_state_mtp;
 struct common_speculative_state_dflash;
+struct common_speculative_state_dspark;
 
 static common_speculative_state_mtp * common_speculative_get_mtp_state(common_speculative * spec);
 static const common_speculative_state_mtp * common_speculative_get_mtp_state(const common_speculative * spec);
 static common_speculative_state_dflash * common_speculative_get_dflash_state(common_speculative * spec);
 static const common_speculative_state_dflash * common_speculative_get_dflash_state(const common_speculative * spec);
+static common_speculative_state_dspark * common_speculative_get_dspark_state(common_speculative * spec);
+static const common_speculative_state_dspark * common_speculative_get_dspark_state(const common_speculative * spec);
 static int32_t common_speculative_feature_width(const common_speculative * spec);
 static void mtp_invalidate_cached_drafts(common_speculative_state_mtp & state);
 static bool common_speculative_checkpoint_save(
@@ -359,6 +364,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 };
 
 #include "speculative-dflash-impl.h"
+#include "speculative-dspark-impl.h"
 
 struct common_speculative_state_draft : public common_speculative_state {
     llama_context * ctx_tgt; // only used for retokenizing from ctx_dft
@@ -1182,6 +1188,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft_dspark";
         case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
@@ -1263,9 +1270,14 @@ common_speculative * common_speculative_init(
         return stage.type == COMMON_SPECULATIVE_TYPE_DFLASH;
     });
 
+    const bool has_dspark_stage = std::any_of(stages.begin(), stages.end(), [](const common_speculative_stage_params & stage) {
+        return stage.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+
     const bool needs_draft_ctx = std::any_of(stages.begin(), stages.end(), [&params](const common_speculative_stage_params & stage) {
         return stage.type == COMMON_SPECULATIVE_TYPE_DRAFT ||
                stage.type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+               stage.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
                (stage.type == COMMON_SPECULATIVE_TYPE_MTP && params.model_dft != nullptr);
     });
 
@@ -1302,6 +1314,37 @@ common_speculative * common_speculative_init(
             const int64_t required_n_ctx = (int64_t) max_cross_ctx + (int64_t) block_size;
             if (required_n_ctx > std::numeric_limits<int32_t>::max()) {
                 LOG_ERR("%s: invalid DFlash draft context size cross_ctx=%d block_size=%d required_n_ctx=%lld\n",
+                        __func__, max_cross_ctx, block_size, (long long) required_n_ctx);
+                return nullptr;
+            }
+
+            cparams_dft.n_ctx = (uint32_t) required_n_ctx;
+        }
+
+        if (has_dspark_stage) {
+            // Unlike DFlash, DSpark's tok_embd/output tensors are a self-contained (frozen copy
+            // of the target's) GGUF export, not shared llama_model tensor pointers, so no
+            // llama_model_share_dflash_io_tensors()-equivalent call is needed here.
+            int32_t max_cross_ctx = 0;
+            for (const auto & stage : stages) {
+                if (stage.type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+                    continue;
+                }
+
+                // Reuses the generic dflash_cross_ctx stage field/CLI key ("cross_ctx=") --
+                // DSpark's target-tap context window is the same kind of parameter.
+                max_cross_ctx = std::max(max_cross_ctx, params.with_stage_overrides(stage).dflash_cross_ctx);
+            }
+
+            const int32_t block_size = llama_model_dspark_block_size(params.model_dft);
+            if (block_size <= 0) {
+                LOG_ERR("%s: invalid DSpark draft block size\n", __func__);
+                return nullptr;
+            }
+
+            const int64_t required_n_ctx = (int64_t) max_cross_ctx + (int64_t) block_size;
+            if (required_n_ctx > std::numeric_limits<int32_t>::max()) {
+                LOG_ERR("%s: invalid DSpark draft context size cross_ctx=%d block_size=%d required_n_ctx=%lld\n",
                         __func__, max_cross_ctx, block_size, (long long) required_n_ctx);
                 return nullptr;
             }
@@ -1381,6 +1424,20 @@ common_speculative * common_speculative_init(
                     config.params.dflash_cross_ctx);
                 if (!state->ready) {
                     LOG_ERR("%s: failed to initialize DFlash speculative state\n", __func__);
+                    return nullptr;
+                }
+                impls.push_back(std::move(state));
+                ctx_dft = nullptr;
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
+                auto state = std::make_unique<common_speculative_state_dspark>(
+                    config.type,
+                    ctx_tgt,
+                    ctx_dft,
+                    config.params.dflash_cross_ctx);
+                if (!state->ready) {
+                    LOG_ERR("%s: failed to initialize DSpark speculative state\n", __func__);
                     return nullptr;
                 }
                 impls.push_back(std::move(state));
@@ -1765,7 +1822,10 @@ static bool common_speculative_collect_target_batch_features(
         const llama_batch & batch,
         common_speculative_feature_view & features) {
     features = {};
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH) ||
+            common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+        // DSpark reuses DFlash's multi-layer capture callback/feature-view format verbatim --
+        // see the file header comment in speculative-dspark-impl.h.
         return llama_spec_get_dflash_feature_view(ctx, batch, features);
     }
 
@@ -1787,7 +1847,8 @@ static bool common_speculative_collect_target_seq_batch_features(
         llama_seq_id seq_id,
         common_speculative_feature_view & features) {
     features = {};
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH) ||
+            common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         return llama_spec_get_dflash_feature_view_for_seq(ctx, batch, seq_id, features);
     }
 
@@ -1874,7 +1935,8 @@ int common_speculative_get_configured_n_max(const common_speculative * spec) {
 
 static bool common_speculative_has_target_features(const common_speculative * spec) {
     return common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP) ||
-        common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH);
+        common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
 }
 
 bool common_speculative_load_draft_model(
@@ -1896,7 +1958,7 @@ bool common_speculative_load_draft_model(
     params_dft.k_cache_hadamard = params_base.k_cache_hadamard;
     params_dft.v_cache_hadamard = params_base.v_cache_hadamard;
 
-    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) || params.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         params_dft.split_mode = params_base.split_mode;
         for (size_t i = 0; i < std::size(params_dft.tensor_split); ++i) {
             params_dft.tensor_split[i] = params_base.tensor_split[i];
@@ -1924,7 +1986,8 @@ bool common_speculative_load_draft_model(
     if (params_dft.n_ctx == 0) {
         params_dft.n_ctx = params.n_ctx;
     }
-    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) && params_dft.n_gpu_layers < 0) {
+    if ((params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) || params.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) &&
+            params_dft.n_gpu_layers < 0) {
         params_dft.n_gpu_layers = params_base.n_gpu_layers;
     }
     params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
@@ -2095,7 +2158,8 @@ int32_t common_speculative_on_target_seq_batch(
         return 0;
     }
 
-    if (!common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (!common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH) &&
+            !common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         llama_context * ctx_mtp = common_speculative_get_companion_ctx(spec);
         ctx_mtp = ctx_mtp ? ctx_mtp : ctx_tgt;
         if (ctx_mtp == nullptr) {
@@ -2151,7 +2215,8 @@ bool common_speculative_copy_output_hidden_rows(
         const std::vector<int32_t> & output_indices,
         std::vector<float> & hidden_rows) {
     hidden_rows.clear();
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH) ||
+            common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         return llama_spec_copy_dflash_rows_from_output_indices(ctx, output_indices, hidden_rows);
     }
 
@@ -2582,9 +2647,35 @@ static const common_speculative_state_dflash * common_speculative_get_dflash_sta
     return common_speculative_get_dflash_state(const_cast<common_speculative *>(spec));
 }
 
+static common_speculative_state_dspark * common_speculative_get_dspark_state(common_speculative * spec) {
+    if (!spec) {
+        return nullptr;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            continue;
+        }
+
+        if (auto * dspark_state = dynamic_cast<common_speculative_state_dspark *>(impl.get())) {
+            return dspark_state;
+        }
+    }
+
+    return nullptr;
+}
+
+static const common_speculative_state_dspark * common_speculative_get_dspark_state(const common_speculative * spec) {
+    return common_speculative_get_dspark_state(const_cast<common_speculative *>(spec));
+}
+
 static int32_t common_speculative_feature_width(const common_speculative * spec) {
     if (const auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         return dflash_state->n_target_features;
+    }
+
+    if (const auto * dspark_state = common_speculative_get_dspark_state(spec); dspark_state != nullptr) {
+        return dspark_state->n_embd_cap;
     }
 
     if (const auto * mtp_state = common_speculative_get_mtp_state(spec); mtp_state != nullptr) {
@@ -2691,6 +2782,10 @@ void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_s
     if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         dflash_clear_target_features(*dflash_state);
     }
+
+    if (auto * dspark_state = common_speculative_get_dspark_state(spec); dspark_state != nullptr) {
+        dspark_state->clear_target_features();
+    }
 }
 
 void common_speculative_clear_sequence(
@@ -2745,6 +2840,10 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
 
     if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         return dflash_state->ctx_dft;
+    }
+
+    if (auto * dspark_state = common_speculative_get_dspark_state(spec); dspark_state != nullptr) {
+        return dspark_state->ctx_dft;
     }
 
     return nullptr;
@@ -2818,6 +2917,34 @@ int32_t common_speculative_on_target_batch(
         }
 
         if (!dflash_append_target_features(*dflash_state, features, seq_id)) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (auto * dspark_state = common_speculative_get_dspark_state(spec); dspark_state != nullptr) {
+        if (features.kind != COMMON_SPECULATIVE_FEATURE_HIDDEN_STATE || batch.n_tokens <= 0) {
+            return 0;
+        }
+
+        if (features.width != dspark_state->n_embd_cap) {
+            LOG_ERR("%s: DSpark feature width mismatch: got %d expected %d\n",
+                    __func__, features.width, dspark_state->n_embd_cap);
+            return -1;
+        }
+
+        if (batch.n_seq_id == nullptr || batch.seq_id == nullptr || batch.n_seq_id[0] <= 0 || batch.seq_id[0] == nullptr) {
+            return -1;
+        }
+
+        const llama_seq_id seq_id = batch.seq_id[0][0];
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr || batch.seq_id[i][0] != seq_id) {
+                return -1;
+            }
+        }
+
+        if (!dspark_state->append_target_features(features, seq_id)) {
             return -1;
         }
         return 0;
@@ -2936,6 +3063,10 @@ void common_speculative_context_shift(
 
     if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         dflash_context_shift(*dflash_state, kv_keep, kv_discard, kv_past);
+    }
+
+    if (auto * dspark_state = common_speculative_get_dspark_state(spec); dspark_state != nullptr) {
+        dspark_state->context_shift(kv_keep, kv_discard, kv_past);
     }
 }
 

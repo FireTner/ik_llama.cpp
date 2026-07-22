@@ -150,6 +150,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash draft model
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark block-diffusion draft model
     COMMON_SPECULATIVE_TYPE_MTP,           // MTP model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding

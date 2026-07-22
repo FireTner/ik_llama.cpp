@@ -13,6 +13,27 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### DFlash Draft Model (`dflash`)
+
+A draft model trained against a bounded window of the target model's multi-layer hidden-state
+taps, with cross-attention over that window built into the draft model's own forward pass
+(`-md`, plus `cross_ctx` to size the target-feature window).
+
+### DSpark Block-Diffusion Draft Model (`draft-dspark`)
+
+An EAGLE-style block-diffusion drafter: like `dflash`, it taps a fixed set of the target
+model's layers (concatenated multi-layer hidden states, reusing the same capture mechanism as
+`dflash`) over a bounded context window (`cross_ctx`, same meaning as for `dflash`), but instead
+of causal cross-attention it denoises a whole `block_size`-token block at once with fully
+non-causal attention over `[target-tap context | draft block]`. Requires `-md/--model-draft`
+pointed at a DSpark GGUF. The initial port samples draft tokens greedily from the base trunk
+logits; the model's markov-head resampling and confidence-head gating are loaded but not yet
+applied.
+
+```
+llama-server [...] --model-draft dspark.gguf --spec-type draft-dspark:n_max=4,cross_ctx=512
+```
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -113,6 +134,8 @@ Each `--spec-type` entry defines one speculative stage. Repeat it to configure t
 |------|-------------|
 | `none` | No speculative decoding |
 | `draft` | Draft-model speculative decoding; pair with `-md/--model-draft` |
+| `dflash` | DFlash draft model with target-tap cross-attention; pair with `-md/--model-draft` |
+| `draft-dspark` | DSpark block-diffusion draft model with target-tap taps; pair with `-md/--model-draft` |
 | `mtp` | Embedded or assistant-backed MTP |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
@@ -129,6 +152,7 @@ Canonical stage keys:
 | `n_min` | Minimum usable drafted tokens for that stage |
 | `p_min` | Minimum speculative probability threshold |
 | `heads` | MTP heads to use; `1` is the default, while values above `1` and `0` (all model heads) are experimental |
+| `cross_ctx` | Target-tap context window size, for `dflash` and `draft-dspark` |
 | `ngram_size_n` | Lookup n-gram size |
 | `ngram_size_m` | Draft m-gram size |
 | `ngram_min_hits` | Minimum matching hits for n-gram map stages |
@@ -158,6 +182,9 @@ Examples:
 
 # Draft-model speculation
 ./llama-server [...] --model-draft draft.gguf --spec-type draft:n_max=4,p_min=0.0
+
+# DSpark block-diffusion draft model
+./llama-server [...] --model-draft dspark.gguf --spec-type draft-dspark:n_max=4,cross_ctx=512
 
 # Two-stage self-spec -> MTP fallback
 ./llama-server [...] \

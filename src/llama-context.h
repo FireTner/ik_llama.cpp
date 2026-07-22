@@ -392,6 +392,30 @@ struct llama_context {
     dflash_runtime dflash;
     using dflash_capture_state = dflash_runtime::capture_state;
 
+    // DSpark: minimal runtime side-channel for the non-causal target-tap context window (see
+    // llama-spec-features-dspark.cpp / llama_set_dspark_ctx()). Unlike DFlash's dflash_runtime
+    // above, DSpark keeps no persistent per-layer K/V cache: build_dspark() recomputes the
+    // target-tap projection (dspark_fc + dspark_hidden_norm, then each layer's own k_proj/v_proj)
+    // fresh from these staged raw features on every graph build, which is what upstream Prism's
+    // own reference forward pass does too (see src/graphs/build_dspark.cpp file header). This
+    // trades a (bounded, small) amount of recompute for a much simpler runtime -- an incremental
+    // cache analogous to dflash_runtime::kv_runtime_state is future work if profiling shows it's
+    // needed.
+    struct dspark_runtime {
+        struct ctx_state {
+            std::vector<float>     feat_owned; // [n_embd_cap, n_rows], row-major matching the ggml input tensor
+            std::vector<llama_pos> pos_owned;  // [n_rows] absolute target positions for each tap row
+            int32_t n_rows = 0;
+        };
+        ctx_state ctx;
+
+        // graph inputs, (re)created by build_dspark() every graph build; populated with the
+        // staged `ctx` data by llama_prepare_dspark_graph_inputs() right before compute.
+        struct ggml_tensor * ctx_feat_tensor = nullptr; // F32 [n_embd_cap, n_ctx_rows]
+        struct ggml_tensor * ctx_pos_tensor  = nullptr; // I32 [n_ctx_rows]
+    };
+    dspark_runtime dspark;
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]

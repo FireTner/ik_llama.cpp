@@ -33,6 +33,9 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
+#define VDR_Q1_0_G128_Q8_1_MMVQ 1  // Process one 32-element chunk at a time
+#define VDR_Q1_0_G128_Q8_1_MMQ  4  // Q1_0_G128 has 128 bits (4 ints) per block
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -562,6 +565,55 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     }
 
     return d6 * sumf_d;
+}
+
+static __device__ __forceinline__ float vec_dot_q1_0_g128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q1_0_g128 * bq1_0 = (const block_q1_0_g128 *) vbq + kbx;
+
+    // Q1_0_G128: 128 elements with ONE scale
+    // Q8_1: 32 elements per block with individual scales
+    // iqs selects which of the 4 chunks of 32 elements to process (0-3)
+
+    const float     d1 = bq1_0->d;
+    const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
+
+    // Process only the chunk specified by iqs
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+
+        const int u0 = get_int_b4(bq8_1_chunk->qs, j*4+0);
+        const int u1 = get_int_b4(bq8_1_chunk->qs, j*4+1);
+        const int u2 = get_int_b4(bq8_1_chunk->qs, j*4+2);
+        const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
+
+        // unpack crumbs into nibble indices
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+        // unpack nibbles into byte values
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        // unshuffle values
+        const int v0 = __byte_perm(s0, s1, 0x5410);
+        const int v1 = __byte_perm(s0, s1, 0x7632);
+        const int v2 = __byte_perm(s2, s3, 0x5410);
+        const int v3 = __byte_perm(s2, s3, 0x7632);
+
+        sumi = ggml_cuda_dp4a(v0, u0, sumi);
+        sumi = ggml_cuda_dp4a(v1, u1, sumi);
+        sumi = ggml_cuda_dp4a(v2, u2, sumi);
+        sumi = ggml_cuda_dp4a(v3, u3, sumi);
+    }
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d1 * d8 * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

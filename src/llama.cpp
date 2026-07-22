@@ -18,6 +18,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-spec-features.h"
+#include "llama-spec-features-dspark.h"
 #include "llama-dflash.h"
 #include "llama-quantize.h"
 
@@ -5810,6 +5811,7 @@ static int llama_decode_internal(
     n_outputs_embd = has_mtp && cparams.mtp_op_type == MTP_OP_NONE ? n_tokens_all : n_outputs;
     const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
     const bool is_dflash_decode = lctx.model.arch == LLM_ARCH_DFLASH_DRAFT;
+    const bool is_dspark_decode = lctx.model.arch == LLM_ARCH_DSPARK;
     const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs);
     if (reserved_outputs < required_outputs) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %zu outputs\n", __func__, required_outputs);
@@ -6071,6 +6073,10 @@ static int llama_decode_internal(
         }
 
         if (is_dflash_decode && !llama_prepare_dflash_graph_inputs(lctx, n_tokens)) {
+            return GGML_STATUS_FAILED;
+        }
+
+        if (is_dspark_decode && !llama_prepare_dspark_graph_inputs(lctx, n_tokens)) {
             return GGML_STATUS_FAILED;
         }
 
@@ -8322,6 +8328,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_GEMMA4_MTP:
         case LLM_ARCH_DFLASH_DRAFT:
         case LLM_ARCH_GEMMA4_ASSISTANT:
+        case LLM_ARCH_DSPARK:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

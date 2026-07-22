@@ -42,6 +42,7 @@ add_library(llama
             llama.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
+            llama-spec-features-dspark.cpp
             llama-dflash.cpp
             llama-vocab.cpp
             llama-grammar.cpp
@@ -104,6 +105,7 @@ add_library(llama
             graphs/build_gemma3.cpp
             graphs/build_gemma4.cpp
             graphs/build_dflash.cpp
+            graphs/build_dspark.cpp
             graphs/build_mamba.cpp
             graphs/build_command_r.cpp
             graphs/build_olmo.cpp

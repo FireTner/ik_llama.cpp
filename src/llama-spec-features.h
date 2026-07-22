@@ -25,6 +25,7 @@ struct llama_spec_feature_view {
 };
 
 #include "llama-spec-features-dflash.h"
+#include "llama-spec-features-dspark.h"
 
 uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx);
 

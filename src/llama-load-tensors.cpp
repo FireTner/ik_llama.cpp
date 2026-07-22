@@ -102,6 +102,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_dflash_tensors(const LLM_TN & tn);
 
+    bool create_dspark_tensors(const LLM_TN & tn);
+
     bool create_starcoder2_tensors(const LLM_TN & tn);
 
     bool create_mamba_tensors(const LLM_TN & tn);
@@ -2329,6 +2331,87 @@ bool create_tensors_helper::create_dflash_tensors(const LLM_TN & tn) {
         layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
         layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
         layer.ffn_up = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, n_ff}, 0);
+    }
+
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_dspark_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const bool use_split_ctx = model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN;
+
+    // DSpark ships no tokenizer of its own (it ties to the TARGET model's vocab), so
+    // hparams.n_vocab is 0 here. The real vocab width only exists as token_embd's own
+    // shape in the GGUF (a frozen copy of the target's embedding table) -- peek at it
+    // before creating anything, mirroring the upstream Prism converter contract.
+    const ggml_tensor * tok_embd_meta = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").c_str());
+    const int64_t n_vocab_dspark = tok_embd_meta ? tok_embd_meta->ne[1] : n_vocab;
+    if (n_vocab_dspark <= 0) {
+        throw std::runtime_error("dspark: could not determine vocab size from token_embd.weight");
+    }
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, 0);
+
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    model.output = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    if (model.output == nullptr) {
+        // DSpark's lm_head is a frozen copy of the target's, not tied to token_embd, but
+        // fall back the same way other dense arches do in case a future export ties them.
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_DUPLICATED);
+    }
+
+    // target-feature projection: [n_capture * n_embd -> n_embd], then RMSNorm.
+    const int64_t n_capture = hparams.n_dspark_target_layers;
+    const int64_t n_embd_cap = n_capture * n_embd;
+    const int64_t markov_rank = hparams.dspark_markov_rank;
+
+    model.dspark_fc = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_FC, "weight"), {n_embd_cap, n_embd}, 0);
+    model.dspark_hidden_norm = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_HIDDEN_NORM, "weight"), {n_embd}, 0);
+
+    // auxiliary heads: loaded so the GGUF's tensor inventory is fully mapped and
+    // available to a future host-side block-diffusion resample loop, but (like upstream
+    // Prism) not built into build_dspark() yet -- see src/graphs/build_dspark.cpp.
+    if (markov_rank > 0) {
+        model.dspark_markov_head_a = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_A, "weight"), {markov_rank, n_vocab_dspark}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        model.dspark_markov_head_b = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_B, "weight"), {markov_rank, n_vocab_dspark}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    }
+
+    if (hparams.dspark_confidence_head) {
+        const int64_t conf_in = n_embd + (hparams.dspark_confidence_head_with_markov ? markov_rank : 0);
+        model.dspark_confidence_head   = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "weight"), {conf_in, 1}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        model.dspark_confidence_head_b = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "bias"),   {1},         llama_model_loader::TENSOR_NOT_REQUIRED);
+    }
+
+    // GIDD log-SNR conditioning (LogSnrEmbed): unlike markov_head/confidence_head above,
+    // this DOES change the draft embedding every forward pass once implemented, so when
+    // the GGUF says log_snr_conditioning is on these weights are required.
+    if (hparams.dspark_log_snr_conditioning) {
+        const int64_t n_freq = 128; // sinusoidal feature count (LogSnrEmbed)
+        model.dspark_log_snr_fc1   = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), {n_freq, n_embd}, 0);
+        model.dspark_log_snr_fc1_b = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "bias"),   {n_embd}, 0);
+        model.dspark_log_snr_fc2   = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "weight"), {n_embd, n_embd}, 0);
+        model.dspark_log_snr_fc2_b = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   {n_embd}, 0);
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_split = use_split_ctx ? ctx_for_layer_split(i) : ctx_for_layer(i);
+        auto & layer = model.layers[i];
+
+        layer.attn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+        layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+        layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_gqa}, 0);
+        layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_gqa}, 0);
+        layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head, n_embd}, 0);
+
+        layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+        layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+        layer.ffn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+        layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+        layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
     }
 
     return use_mmap_buffer;
@@ -4660,6 +4743,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_gemma4_mtp_tensors(tn); break;
         case LLM_ARCH_DFLASH_DRAFT:
             use_mmap_buffer = create_dflash_tensors(tn); break;
+        case LLM_ARCH_DSPARK:
+            use_mmap_buffer = create_dspark_tensors(tn); break;
         case LLM_ARCH_STARCODER2:
             use_mmap_buffer = create_starcoder2_tensors(tn); break;
         case LLM_ARCH_MAMBA:

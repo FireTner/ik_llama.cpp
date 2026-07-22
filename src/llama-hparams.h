@@ -161,6 +161,18 @@ struct llama_hparams {
     uint32_t dflash_target_layer_ids[8] = {};
     float    dflash_backbone_rotary_base = 0.0f;
 
+    // DSpark draft model metadata (EAGLE-style block-diffusion drafter)
+    uint32_t dspark_block_size = 0;
+    uint32_t dspark_mask_token_id = 0;
+    uint32_t n_dspark_target_layers = 0;
+    uint32_t dspark_target_layers[8] = {};
+    uint32_t dspark_markov_rank = 0;
+    bool     dspark_confidence_head = false;
+    bool     dspark_confidence_head_with_markov = false;
+    bool     dspark_log_snr_conditioning = false;
+    float    dspark_min_log_snr = 0.0f;
+    float    dspark_max_log_snr = 0.0f;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
     llama_token dec_start_token_id = -1;
@@ -184,6 +196,13 @@ struct llama_hparams {
         if (this->dflash_mask_token_id != other.dflash_mask_token_id) return true;
         if (this->dflash_n_target_features != other.dflash_n_target_features) return true;
         if (this->dflash_n_target_layers != other.dflash_n_target_layers) return true;
+        if (this->dspark_block_size != other.dspark_block_size) return true;
+        if (this->dspark_mask_token_id != other.dspark_mask_token_id) return true;
+        if (this->n_dspark_target_layers != other.n_dspark_target_layers) return true;
+        if (this->dspark_markov_rank != other.dspark_markov_rank) return true;
+        if (this->dspark_confidence_head != other.dspark_confidence_head) return true;
+        if (this->dspark_confidence_head_with_markov != other.dspark_confidence_head_with_markov) return true;
+        if (this->dspark_log_snr_conditioning != other.dspark_log_snr_conditioning) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -217,6 +236,11 @@ struct llama_hparams {
         for (int i = 0; i < 8; ++i) {
             if (this->dflash_target_layer_ids[i] != other.dflash_target_layer_ids[i]) return true;
         }
+        for (int i = 0; i < 8; ++i) {
+            if (this->dspark_target_layers[i] != other.dspark_target_layers[i]) return true;
+        }
+        if (!is_float_close(this->dspark_min_log_snr, other.dspark_min_log_snr, 1e-9f)) return true;
+        if (!is_float_close(this->dspark_max_log_snr, other.dspark_max_log_snr, 1e-9f)) return true;
 
         if (this->dec_start_token_id != other.dec_start_token_id) return true;
 

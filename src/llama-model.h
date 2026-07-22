@@ -455,6 +455,18 @@ struct llama_model {
     struct ggml_tensor * dflash_fc = nullptr;
     struct ggml_tensor * dflash_hidden_norm = nullptr;
 
+    // DSpark draft model tensors
+    struct ggml_tensor * dspark_fc = nullptr;
+    struct ggml_tensor * dspark_hidden_norm = nullptr;
+    struct ggml_tensor * dspark_markov_head_a = nullptr;
+    struct ggml_tensor * dspark_markov_head_b = nullptr;
+    struct ggml_tensor * dspark_confidence_head = nullptr;
+    struct ggml_tensor * dspark_confidence_head_b = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc1 = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc1_b = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2 = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_b = nullptr;
+
     struct ggml_tensor * output_norm;
     struct ggml_tensor * output_norm_b;
     struct ggml_tensor * output;

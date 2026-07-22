@@ -2603,6 +2603,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_dflash();
             } break;
+        case LLM_ARCH_DSPARK:
+            {
+                result = llm.build_dspark();
+            } break;
         case LLM_ARCH_STARCODER2:
             {
                 result = llm.build_starcoder2();

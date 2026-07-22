@@ -87,6 +87,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DFLASH_DRAFT,    "dflash-draft" },
     { LLM_ARCH_GEMMA4_ASSISTANT,"gemma4-assistant"   },
     { LLM_ARCH_OPENPANGU,       "openpangu"    },
+    { LLM_ARCH_DSPARK,          "dspark"       },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -167,6 +168,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,           "%s.dflash.target_layer_ids"           },
     { LLM_KV_DFLASH_N_TARGET_FEATURES,          "%s.dflash.n_target_features"          },
     { LLM_KV_DFLASH_BACKBONE_ROTARY_BASE,       "%s.dflash.backbone_rotary_base"       },
+    { LLM_KV_DSPARK_BLOCK_SIZE,                  "%s.block_size"                 },
+    { LLM_KV_DSPARK_MASK_TOKEN_ID,               "%s.mask_token_id"              },
+    { LLM_KV_DSPARK_TARGET_LAYERS,               "%s.target_layers"              },
+    { LLM_KV_DSPARK_MARKOV_RANK,                 "%s.markov_rank"                },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD,              "%s.confidence_head"            },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD_WITH_MARKOV,  "%s.confidence_head_with_markov" },
+    { LLM_KV_DSPARK_LOG_SNR_CONDITIONING,         "%s.log_snr_conditioning"       },
+    { LLM_KV_DSPARK_MIN_LOG_SNR,                  "%s.min_log_snr"                },
+    { LLM_KV_DSPARK_MAX_LOG_SNR,                  "%s.max_log_snr"                },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },

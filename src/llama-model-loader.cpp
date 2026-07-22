@@ -534,6 +534,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_Q4_0_4_4: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_4_4; break;
             case GGML_TYPE_Q4_0_4_8: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_4_8; break;
             case GGML_TYPE_Q4_0_8_8: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_8_8; break;
+            case GGML_TYPE_Q1_0_G128: ftype = LLAMA_FTYPE_MOSTLY_Q1_0_G128; break;
             default:
                 {
                      LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -541,13 +542,21 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
                 } break;
         }
 
-        // this is a way to mark that we have "guessed" the file type
+            // this is a way to mark that we have "guessed" the file type
         ftype = (llama_ftype) (ftype | LLAMA_FTYPE_GUESSED);
 
         {
             const int kid = gguf_find_key(meta, "general.file_type"); // TODO: use LLM_KV
             if (kid >= 0) {
-                ftype = (llama_ftype) gguf_get_val_u32(meta, kid);
+                uint32_t ft = gguf_get_val_u32(meta, kid);
+                // Bonsai GGUFs in the wild:
+                //   Prism Q1_0_g128 ftype historically 27; some packs store 40
+                //   (near GGML_TYPE_Q1_0=40 on Prism). ik uses LLAMA_FTYPE_MOSTLY_Q1_0_G128=41
+                //   (29 is already IQ2_M here).
+                if (type_max == GGML_TYPE_Q1_0_G128 && (ft == 27 || ft == 40)) {
+                    ft = LLAMA_FTYPE_MOSTLY_Q1_0_G128;
+                }
+                ftype = (llama_ftype) ft;
             }
         }
 

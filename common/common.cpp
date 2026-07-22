@@ -220,6 +220,7 @@ bool common_params_speculative::has_composite_stage_chain() const {
 bool common_params_speculative::needs_dft_model() const {
     return has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
         has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
         (has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && has_dft());
 }
 
@@ -295,12 +296,17 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("speculative stage has n_min greater than n_max");
         }
 
-        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || stage.type == COMMON_SPECULATIVE_TYPE_DFLASH) && !params.has_dft()) {
+        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || stage.type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                    stage.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) && !params.has_dft()) {
             return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
         }
 
         if (stage.type == COMMON_SPECULATIVE_TYPE_DFLASH && stage_params.dflash_cross_ctx < 1) {
             return fail("dflash speculative stage requires cross_ctx >= 1");
+        }
+
+        if (stage.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK && stage_params.dflash_cross_ctx < 1) {
+            return fail("draft-dspark speculative stage requires cross_ctx >= 1");
         }
     }
 
@@ -3328,13 +3334,15 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                               "  gpu-fallback copy state to GPU buffer; re-decode on rejection\n"
                                                               "  cpu          serialise state via llama_state_seq; re-decode on rejection" });
     options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
-                                                              "types: none, draft, dflash, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
+                                                              "types: none, draft, dflash, draft-dspark, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
                                                               "canonical keys: n_max,n_min,p_min,heads,cross_ctx,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
                                                               "MTP heads: heads=1 is the default; heads>1 and heads=0 (all model heads) are experimental\n"
+                                                              "draft-dspark: EAGLE-style block-diffusion drafter (-md required); cross_ctx bounds the target-tap context window like dflash's\n"
                                                               "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
                                                               "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
                                                               "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --model-draft draft.gguf --spec-type dflash:n_max=4,cross_ctx=512\n"
+                                                              "          --model-draft dspark.gguf --spec-type draft-dspark:n_max=4,cross_ctx=512\n"
                                                               "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
                                                               "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });

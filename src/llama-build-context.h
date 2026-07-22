@@ -260,6 +260,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_dflash_kv_cache();
 
+    ggml_cgraph * build_dspark();
+
     ggml_cgraph * build_starcoder2();
 
     ggml_cgraph * build_mamba();

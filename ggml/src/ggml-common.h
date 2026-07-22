@@ -158,6 +158,10 @@ typedef sycl::half2 ggml_half2;
 #define QI1_BN (QK_IQ1BN / (4*QR1_BN))
 #define QR1_BN 8
 
+// Bonsai Q1_0_G128: QI = number of int32s of packed bits per block (QK/32)
+#define QI1_0_G128 (QK1_0_G128 / 32)
+#define QR1_0_G128 1
+
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
 
