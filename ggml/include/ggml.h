@@ -2648,7 +2648,8 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * score,
             struct ggml_tensor  * idx,
-            int                   ratio);
+            int                   ratio,
+            int                   type);
 
 
     // custom operators
