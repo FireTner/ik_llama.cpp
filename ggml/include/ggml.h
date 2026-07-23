@@ -710,6 +710,7 @@ extern "C" {
         GGML_OP_HC_PRE,
         GGML_OP_HC_POST,
         GGML_OP_MASK_TO_IDX,
+        GGML_OP_DS4_COMP,
 
         GGML_OP_COUNT,
     };
@@ -2641,6 +2642,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
             int                   max_row_size);
+
+    GGML_API struct ggml_tensor * ggml_ds4_comp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * idx,
+            int                   ratio);
 
 
     // custom operators
