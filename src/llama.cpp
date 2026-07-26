@@ -4690,6 +4690,10 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 
         model.mtp = params.mtp;
 
+        // Feature 1: DSpark drafter IO-tensor sharing. When set, create_dspark_tensors() skips
+        // allocating token_embd/output so they can be aliased to the target's after load.
+        model.spec_share_io_tensors = params.spec_share_io_tensors;
+
         try {
             llm_load_arch(ml, model);
         } catch(const std::exception & e) {
@@ -7233,6 +7237,7 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.spec_share_io_tensors       =*/ false,
     };
 
 #ifdef GGML_USE_METAL

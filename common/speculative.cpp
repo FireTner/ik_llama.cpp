@@ -1322,9 +1322,26 @@ common_speculative * common_speculative_init(
         }
 
         if (has_dspark_stage) {
-            // Unlike DFlash, DSpark's tok_embd/output tensors are a self-contained (frozen copy
-            // of the target's) GGUF export, not shared llama_model tensor pointers, so no
-            // llama_model_share_dflash_io_tensors()-equivalent call is needed here.
+            // Feature 1: DSpark's tok_embd/output are frozen copies of the target's, so alias them
+            // to the target's higher-precision resident tensors instead of loading duplicate
+            // ~1.2-1.4 GiB copies. The drafter was loaded with spec_share_io_tensors=1, so those
+            // tensors are currently null; validate the dimension contract, then repoint them.
+            const llama_model * model_tgt = llama_get_model(ctx_tgt);
+            const int32_t target_n_embd  = llama_model_n_embd(model_tgt);
+            const int32_t target_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            if (!llama_model_dspark_io_tensors_match(params.model_dft, target_n_embd, target_n_vocab)) {
+                LOG_ERR("%s: DSpark drafter IO contract does not match the target (target n_embd=%d n_vocab=%d)\n",
+                        __func__, target_n_embd, target_n_vocab);
+                return nullptr;
+            }
+            if (!llama_model_share_dspark_io_tensors(params.model_dft, model_tgt)) {
+                LOG_ERR("%s: failed to share target IO tensors with DSpark draft model\n", __func__);
+                return nullptr;
+            }
+            LOG_INF("%s: DSpark: sharing target IO tensors, drafter keeps only its unique weights "
+                    "(avoided duplicating token_embd+output for n_embd=%d n_vocab=%d)\n",
+                    __func__, target_n_embd, target_n_vocab);
+
             int32_t max_cross_ctx = 0;
             for (const auto & stage : stages) {
                 if (stage.type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
@@ -1997,6 +2014,11 @@ bool common_speculative_load_draft_model(
     params.mparams_dft.path = params_dft.model;
 
     llama_model_params mparams_dft = common_model_params_to_llama(params_dft);
+    // Feature 1: for a DSpark drafter, skip allocating its token_embd/output at load so they can be
+    // aliased to the target model's resident tensors afterwards (see
+    // llama_model_share_dspark_io_tensors). DFlash needs no equivalent flag: its GGUF simply omits
+    // those tensors. This is gated strictly to the DSpark case so no other load path changes.
+    mparams_dft.spec_share_io_tensors = params.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
     llama_model * loaded_model = llama_model_load_from_file(params_dft.model.c_str(), mparams_dft);
     if (loaded_model == nullptr) {
         LOG_ERR("%s: failed to load draft model '%s'\n", __func__, params.model.c_str());

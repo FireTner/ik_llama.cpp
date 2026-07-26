@@ -432,6 +432,10 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool spec_share_io_tensors; // if true (DSpark drafter only), skip allocating this model's
+                                    // token_embd/output at load time so they can be aliased to a
+                                    // target model's resident tensors after load (see
+                                    // llama_model_share_dspark_io_tensors)
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

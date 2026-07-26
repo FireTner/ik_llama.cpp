@@ -77,6 +77,109 @@ int32_t llama_model_dspark_markov_rank(const struct llama_model * model) {
     return llama_model_is_dspark(model) ? (int32_t) model->hparams.dspark_markov_rank : 0;
 }
 
+bool llama_model_dspark_io_tensors_match(const struct llama_model * draft_model, int32_t n_embd, int32_t n_vocab) {
+    if (!llama_model_is_dspark(draft_model) || n_embd <= 0 || n_vocab <= 0) {
+        return false;
+    }
+
+    // The drafter operates in the target's embedding space, so its hidden size must equal the
+    // target's for the shared token_embd/output to be valid.
+    if ((int32_t) draft_model->hparams.n_embd != n_embd) {
+        return false;
+    }
+
+    // Preferred: validate against the vocab width peeked from the drafter's token_embd metadata at
+    // load time (recorded even when the tensor buffer itself was skipped for sharing).
+    if (draft_model->dspark_io_n_vocab > 0) {
+        return (int32_t) draft_model->dspark_io_n_vocab == n_vocab;
+    }
+
+    // Fallback: the drafter actually loaded its own IO tensors -- check their dims directly.
+    if (draft_model->tok_embd != nullptr && draft_model->output != nullptr) {
+        return (int32_t) draft_model->tok_embd->ne[0] == n_embd &&
+               (int32_t) draft_model->tok_embd->ne[1] == n_vocab &&
+               (int32_t) draft_model->output->ne[0]   == n_embd &&
+               (int32_t) draft_model->output->ne[1]   == n_vocab;
+    }
+
+    return false;
+}
+
+bool llama_model_share_dspark_io_tensors(struct llama_model * draft_model, const struct llama_model * target_model) {
+    if (draft_model == nullptr || target_model == nullptr) {
+        return false;
+    }
+
+    // Only ever alias for DSpark drafters; leave every other arch untouched.
+    if (draft_model->arch != LLM_ARCH_DSPARK) {
+        return true;
+    }
+
+    // If the drafter loaded its own IO tensors (sharing was not requested / not skipped), keep the
+    // self-contained tensors as-is -- nothing to alias.
+    if (draft_model->tok_embd != nullptr && draft_model->output != nullptr) {
+        return true;
+    }
+
+    const int32_t n_embd  = (int32_t) draft_model->hparams.n_embd;
+    const int32_t n_vocab = draft_model->dspark_io_n_vocab > 0
+        ? (int32_t) draft_model->dspark_io_n_vocab
+        : 0;
+
+    if (draft_model->tok_embd == nullptr) {
+        if (target_model->tok_embd == nullptr) {
+            return false;
+        }
+        if (n_embd > 0 && n_vocab > 0 &&
+            ((int32_t) target_model->tok_embd->ne[0] != n_embd ||
+             (int32_t) target_model->tok_embd->ne[1] != n_vocab)) {
+            LLAMA_LOG_ERROR("%s: target token_embd shape [%lld, %lld] != draft contract [%d, %d]\n",
+                    __func__,
+                    (long long) target_model->tok_embd->ne[0], (long long) target_model->tok_embd->ne[1],
+                    n_embd, n_vocab);
+            return false;
+        }
+        draft_model->tok_embd = target_model->tok_embd;
+    }
+
+    if (draft_model->output == nullptr) {
+        // Prefer the target's dedicated output (lm_head); fall back to its tok_embd if tied.
+        struct ggml_tensor * tgt_out = target_model->output ? target_model->output : target_model->tok_embd;
+        if (tgt_out == nullptr) {
+            return false;
+        }
+        if (n_embd > 0 && n_vocab > 0 &&
+            ((int32_t) tgt_out->ne[0] != n_embd || (int32_t) tgt_out->ne[1] != n_vocab)) {
+            LLAMA_LOG_ERROR("%s: target output shape [%lld, %lld] != draft contract [%d, %d]\n",
+                    __func__,
+                    (long long) tgt_out->ne[0], (long long) tgt_out->ne[1],
+                    n_embd, n_vocab);
+            return false;
+        }
+        draft_model->output = tgt_out;
+    }
+
+    // build_dspark() uses model.output for the lm_head projection; keep output_mtp consistent with
+    // the dense arches (points at output) so any shared code path stays well-defined.
+    if (draft_model->output_mtp == nullptr) {
+        draft_model->output_mtp = draft_model->output;
+    }
+
+    if (draft_model->tok_embd == nullptr || draft_model->output == nullptr) {
+        return false;
+    }
+
+    // Higher-precision target IO is intentional (can only help accept rate). Log so operators can
+    // confirm the alias and spot accidental type surprises during bring-up.
+    LLAMA_LOG_INFO("%s: DSpark IO share ok: tok_embd type=%s output type=%s (n_embd=%d n_vocab=%d)\n",
+            __func__,
+            ggml_type_name(draft_model->tok_embd->type),
+            ggml_type_name(draft_model->output->type),
+            n_embd, n_vocab);
+
+    return true;
+}
+
 bool llama_model_dspark_has_confidence_head(const struct llama_model * model) {
     return llama_model_is_dspark(model) &&
            model->hparams.dspark_confidence_head &&

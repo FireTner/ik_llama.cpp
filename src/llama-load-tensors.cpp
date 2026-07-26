@@ -2351,15 +2351,38 @@ bool create_tensors_helper::create_dspark_tensors(const LLM_TN & tn) {
     if (n_vocab_dspark <= 0) {
         throw std::runtime_error("dspark: could not determine vocab size from token_embd.weight");
     }
+    // Record the drafter's IO vocab width even when we skip the tensors below, so the post-load
+    // share step (llama_model_share_dspark_io_tensors) can validate the target's dimensions.
+    model.dspark_io_n_vocab = n_vocab_dspark;
 
-    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, 0);
+    // Feature 1: DSpark's token_embd/output are frozen copies of the TARGET model's tensors. When
+    // sharing is requested (spec_share_io_tensors), do NOT allocate/load them here -- they will be
+    // aliased to the target's higher-precision resident tensors after load. This avoids ~1.2-1.4
+    // GiB of duplicated GPU weights and is what lets DSpark fit in 8 GiB alongside the target.
+    // TENSOR_SKIP validates the GGUF still contains them (dimension check) but creates no buffer
+    // and loads no data, leaving the pointers null for the share step to fill (mirrors DFlash's
+    // null-then-share flow, which relies on those tensors simply being absent from its GGUF).
+    if (model.spec_share_io_tensors) {
+        (void) create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_SKIP);
+        (void) create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED);
+        model.tok_embd = nullptr;
+        model.output   = nullptr;
+        model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+        const double skipped_mib = tok_embd_meta
+                ? (double) (ggml_row_size(tok_embd_meta->type, n_embd) * n_vocab_dspark) / 1024.0 / 1024.0 * 2.0
+                : 0.0;
+        LLAMA_LOG_INFO("%s: DSpark: skipping drafter token_embd/output load; will alias target IO tensors (saves ~%.0f MiB)\n",
+                __func__, skipped_mib);
+    } else {
+        model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, 0);
 
-    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    model.output = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_NOT_REQUIRED);
-    if (model.output == nullptr) {
-        // DSpark's lm_head is a frozen copy of the target's, not tied to token_embd, but
-        // fall back the same way other dense arches do in case a future export ties them.
-        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_DUPLICATED);
+        model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (model.output == nullptr) {
+            // DSpark's lm_head is a frozen copy of the target's, not tied to token_embd, but
+            // fall back the same way other dense arches do in case a future export ties them.
+            model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab_dspark}, llama_model_loader::TENSOR_DUPLICATED);
+        }
     }
 
     // target-feature projection: [n_capture * n_embd -> n_embd], then RMSNorm.

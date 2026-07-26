@@ -37,6 +37,21 @@ int32_t llama_model_dspark_target_layer_ids(const struct llama_model * model, in
 
 int32_t llama_model_dspark_markov_rank(const struct llama_model * model);
 
+// Feature 1: IO-tensor sharing, mirroring llama_model_share_dflash_io_tensors(). DSpark's
+// token_embd/output are frozen copies of the target model's tensors, so aliasing the drafter's
+// (skipped-at-load, hence null) pointers to the target's higher-precision resident tensors is
+// numerically safe (can only improve accept rate) and avoids ~1.2-1.4 GiB of duplicated weights.
+
+// Dimension guard: returns true iff `draft_model` is a DSpark model whose IO contract (drafter
+// hidden size and vocab width recorded at load) matches the given target (n_embd, n_vocab).
+bool llama_model_dspark_io_tensors_match(const struct llama_model * draft_model, int32_t n_embd, int32_t n_vocab);
+
+// Aliases draft_model->tok_embd/output/output_mtp to target_model's resident tensors when they
+// were skipped at load (spec_share_io_tensors). No-op returning true for non-DSpark drafters or
+// when the drafter already loaded its own IO tensors (self-contained). Returns false only if
+// sharing was intended (tensors null) but the target is missing the tensors to alias.
+bool llama_model_share_dspark_io_tensors(struct llama_model * draft_model, const struct llama_model * target_model);
+
 // True only if the model both declares confidence_head in its metadata AND the weight tensor
 // actually loaded (some exports mark it TENSOR_NOT_REQUIRED).
 bool llama_model_dspark_has_confidence_head(const struct llama_model * model);

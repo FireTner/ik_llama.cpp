@@ -475,6 +475,15 @@ struct llama_model {
     struct ggml_tensor * dflash_hidden_norm = nullptr;
 
     // DSpark draft model tensors
+    // When true, this (DSpark drafter) model's token_embd/output were intentionally NOT
+    // allocated/loaded so they can be aliased to a target model's resident tensors after load
+    // (Feature 1: avoids ~1.2-1.4 GiB of duplicated IO weights). Set from
+    // llama_model_params::spec_share_io_tensors during load.
+    bool spec_share_io_tensors = false;
+    // Vocab width peeked from the drafter's token_embd.weight metadata at load time. Recorded even
+    // when the tensor itself is skipped (spec_share_io_tensors), so the post-load share step can
+    // still validate the target's IO tensor dimensions against the drafter's contract.
+    int64_t dspark_io_n_vocab = 0;
     struct ggml_tensor * dspark_fc = nullptr;
     struct ggml_tensor * dspark_hidden_norm = nullptr;
     struct ggml_tensor * dspark_markov_head_a = nullptr;
