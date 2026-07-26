@@ -55,12 +55,31 @@ struct common_speculative_state_dspark : public common_speculative_state {
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         const llama_model * model_dft = llama_get_model(ctx_dft);
 
-        // Vocab/tokenizer compatibility requirements are identical to DFlash's (DSpark ties its
-        // token_embd/output to the target's vocab too) -- reuse the same check rather than
-        // duplicating it.
-        if (!common_speculative_are_dflash_compatible(model_tgt, model_dft)) {
-            LOG_ERR("%s: DSpark draft model vocab/tokenizer is incompatible with the target model\n", __func__);
-            return;
+        // Prism DSpark GGUFs intentionally ship tokenizer.ggml.model=none and share the
+        // target's token_embd/output (IO-share). DFlash's tokenizer-text check rejects that
+        // as a vocab-type mismatch; for NONE drafts only n_vocab must agree.
+        {
+            const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+            const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
+            const bool draft_has_no_vocab = llama_vocab_type(vocab_dft) == LLAMA_VOCAB_TYPE_NONE;
+            bool compatible = false;
+            if (draft_has_no_vocab) {
+                const int n_vocab_tgt = llama_vocab_n_tokens(vocab_tgt);
+                const int n_vocab_dft = llama_vocab_n_tokens(vocab_dft);
+                compatible = (n_vocab_tgt == n_vocab_dft);
+                if (!compatible) {
+                    LOG_ERR("%s: DSpark draft has no tokenizer but vocab size mismatch (target=%d draft=%d)\n",
+                            __func__, n_vocab_tgt, n_vocab_dft);
+                }
+            } else {
+                compatible = common_speculative_are_dflash_compatible(model_tgt, model_dft);
+                if (!compatible) {
+                    LOG_ERR("%s: DSpark draft model vocab/tokenizer is incompatible with the target model\n", __func__);
+                }
+            }
+            if (!compatible) {
+                return;
+            }
         }
 
         llama_dspark_meta meta;
