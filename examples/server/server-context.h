@@ -4,8 +4,12 @@
 #include "json-schema-to-grammar.h"
 #include <nlohmann/json_fwd.hpp>
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 
@@ -391,9 +395,49 @@ struct server_context {
 
     bool create_checkpoint(server_slot & slot);
 
+    // create_checkpoint() + flush_checkpoints(), returning true only if the new checkpoint
+    // actually landed in the slot's list (never on a dropped/failed host finalize).
+    bool create_checkpoint_committed(server_slot & slot);
+
     void apply_checkpoint(server_slot & slot);
 
     void create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base);
 
     void release_slot_after_final_response(server_slot & slot);
+
+    // --- Async host-side context-checkpoint finalization ---
+    //
+    // KV serialization (llama_state_seq_get_data) stays synchronous on the decode/prompt loop:
+    // overlapping a device->host read with speculative accept / seq_rm / context-shift is not
+    // race-free here (and is unsupported for hybrid/recurrent models such as qwen35). What moves
+    // off the hot path is the host-side commit: eviction, list maintenance, freeing evicted
+    // buffers, and logging. The worker never touches `ctx` or the GPU; it only mutates a slot's
+    // checkpoints list. The main thread accesses that list only after flush_checkpoints().
+    struct pending_checkpoint {
+        server_slot * slot = nullptr;   // stable pointer (slots vector is fixed for the run)
+        server_prompt_checkpoint ckpt;  // fully serialized on the main thread before enqueue
+        size_t  ctx_checkpoints_n = 0;
+        int     eviction_mode = 0;      // common_checkpoint_eviction
+        int     id_slot = -1;           // captured for thread-safe logging (do NOT touch slot.task)
+        int     id_task = -1;
+        int64_t n_tokens_expected = 0;  // for commit verification / logging
+    };
+
+    std::thread                    checkpoint_worker;
+    std::mutex                     checkpoint_mutex;
+    std::condition_variable        checkpoint_cv;       // wakes the worker
+    std::condition_variable        checkpoint_idle_cv;  // wakes flush waiters
+    std::deque<pending_checkpoint> checkpoint_queue;
+    bool                           checkpoint_worker_started = false;
+    bool                           checkpoint_worker_stop = false;
+    bool                           checkpoint_processing = false;
+
+    void start_checkpoint_worker();
+    void stop_checkpoint_worker();
+    void checkpoint_worker_loop();
+    // Blocks until every queued/in-flight checkpoint commit has completed. MUST be called on the
+    // main thread before it reads or mutates any slot's checkpoints list (apply/create/clear/
+    // save/restore) and before teardown, so the worker and main thread never touch a list at once.
+    void flush_checkpoints();
+    void enqueue_checkpoint(pending_checkpoint && pc);
 };

@@ -179,6 +179,10 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
 }
 
 server_context::~server_context() {
+    // Join the async checkpoint worker first: it holds raw pointers into `slots` and mutates their
+    // checkpoint lists, so it must be fully stopped before anything is torn down.
+    stop_checkpoint_worker();
+
     // Speculative state may reference the live target context during teardown.
     for (server_slot& slot : slots) {
         if (slot.ctx_sampling != nullptr) {
@@ -1043,6 +1047,9 @@ server_slot* server_context::get_available_slot(const server_task& task) {
 
         LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
             (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity);
+        // prompt_save/prompt_load copy the slot's checkpoints list into/out of the prompt cache;
+        // make sure no async checkpoint commit is mutating that list concurrently.
+        flush_checkpoints();
         if (update_cache) {
             const int64_t t_start = ggml_time_us();
             LLAMA_LOG_INFO("updating prompt cache\n");
@@ -2013,6 +2020,9 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 void server_context::kv_cache_clear() {
     LOG_VERBOSE("clearing KV cache", {});
 
+    // Host-commit worker may still be mutating checkpoint lists; drain it before clearing KV.
+    flush_checkpoints();
+
     // clear the entire KV cache
     llama_kv_cache_clear(ctx);
     for (auto & slot : slots) {
@@ -2102,6 +2112,7 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
         slot.n_discarded_prompt = 0;
         slot.n_kept_prompt = 0;
         slot.n_prompt_tokens_cache = 0;
+        flush_checkpoints();
         slot.server_cached_prompt.checkpoints.clear();
         slot.checkpoint_pos = 0;
         slot.do_checkpoint = false;
@@ -2947,6 +2958,7 @@ void server_context::process_single_task(server_task&& task) {
         std::string filename = task.data.at("filename");
         std::string filepath = task.data.at("filepath");
         save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
+        flush_checkpoints();
         size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
         const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
@@ -2990,6 +3002,8 @@ void server_context::process_single_task(server_task&& task) {
 
         slot->cache_tokens.resize(slot->n_ctx);
         size_t token_count = 0;
+        // llama_state_seq_load_file overwrites this sequence's KV cells -- drain host-commit worker first.
+        flush_checkpoints();
         size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
         if (nread == 0) {
             slot->cache_tokens.resize(0);
@@ -2997,6 +3011,7 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
+        flush_checkpoints();
         size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
         const int64_t t_end = ggml_time_us();
@@ -3033,6 +3048,8 @@ void server_context::process_single_task(server_task&& task) {
         }
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
+        // seq_rm mutates this sequence; drain host-commit worker before touching checkpoint lists.
+        flush_checkpoints();
         llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
@@ -3288,6 +3305,8 @@ void server_context::print_tokens(const server_tokens& prompt, const server_toke
 }
 
 void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_slot& slot, int32_t n_keep, int32_t n_discard) {
+    // Context-shift mutates KV and may touch checkpoint bookkeeping; drain host-commit worker first.
+    flush_checkpoints();
     auto kv_keep = slot.cache_tokens.pos_next(n_keep);
     auto kv_discard = slot.cache_tokens.pos_next(n_keep + n_discard) - kv_keep;
     auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
@@ -3589,12 +3608,26 @@ void server_context::add_sampled_tokens() {
     }
 }
 
+bool server_context::create_checkpoint_committed(server_slot & slot) {
+    const int64_t n_tokens_before = slot.cache_tokens.n_tokens();
+    if (!create_checkpoint(slot)) {
+        return false;
+    }
+    flush_checkpoints();
+    const auto & ckpts = slot.server_cached_prompt.checkpoints;
+    if (!ckpts.empty() && ckpts.back().n_tokens == n_tokens_before) {
+        return true;
+    }
+    LOG_ERR("slot id %2d | task %d | checkpoint finalize did not commit (n_tokens=%" PRId64 ")\n",
+        slot.id, slot.task ? slot.task->id : -1, n_tokens_before);
+    return false;
+}
+
 void  server_context::create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base) {
     if (params_base.do_checkpoint && params_base.ctx_checkpoints_interval > 0) {
         auto pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
         if (slot.checkpoint_pos + params_base.ctx_checkpoints_interval <= 1 + pos) {
-            bool created = create_checkpoint(slot);
-            if (created) {
+            if (create_checkpoint_committed(slot)) {
                 slot.checkpoint_pos = pos;
             }
         }
@@ -3602,6 +3635,10 @@ void  server_context::create_checkpoint_at_interval(server_slot & slot, const gp
 }
 
 void server_context::apply_checkpoint(server_slot & slot) {
+    // A restore may depend on a checkpoint whose async commit is still in flight; make sure the
+    // worker has finished before we read/search/erase the list.
+    flush_checkpoints();
+
     llama_pos pos_next = slot.cache_tokens.pos_next(slot.n_past);
     const auto pos_min_thold = std::max(0, pos_next - 1);
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
@@ -3715,7 +3752,115 @@ static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_varianc
     return it;
 }
 
+void server_context::start_checkpoint_worker() {
+    if (checkpoint_worker_started) {
+        return;
+    }
+    checkpoint_worker_stop = false;
+    checkpoint_worker_started = true;
+    checkpoint_worker = std::thread(&server_context::checkpoint_worker_loop, this);
+}
+
+void server_context::stop_checkpoint_worker() {
+    if (!checkpoint_worker_started) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(checkpoint_mutex);
+        checkpoint_worker_stop = true;
+    }
+    checkpoint_cv.notify_all();
+    if (checkpoint_worker.joinable()) {
+        checkpoint_worker.join();
+    }
+    checkpoint_worker_started = false;
+}
+
+void server_context::enqueue_checkpoint(pending_checkpoint && pc) {
+    if (!checkpoint_worker_started) {
+        start_checkpoint_worker();
+    }
+    {
+        std::lock_guard<std::mutex> lock(checkpoint_mutex);
+        checkpoint_queue.push_back(std::move(pc));
+    }
+    checkpoint_cv.notify_one();
+}
+
+void server_context::flush_checkpoints() {
+    if (!checkpoint_worker_started) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(checkpoint_mutex);
+    checkpoint_idle_cv.wait(lock, [&] {
+        return checkpoint_queue.empty() && !checkpoint_processing;
+    });
+}
+
+void server_context::checkpoint_worker_loop() {
+    for (;;) {
+        pending_checkpoint pc;
+        {
+            std::unique_lock<std::mutex> lock(checkpoint_mutex);
+            checkpoint_cv.wait(lock, [&] {
+                return checkpoint_worker_stop || !checkpoint_queue.empty();
+            });
+            if (checkpoint_worker_stop && checkpoint_queue.empty()) {
+                return;
+            }
+            pc = std::move(checkpoint_queue.front());
+            checkpoint_queue.pop_front();
+            checkpoint_processing = true;
+        }
+
+        // Host-only work (no ctx/GPU access): eviction + commit into the slot's checkpoint list +
+        // freeing evicted buffers + logging. Exclusive access to the list is guaranteed because the
+        // main thread only touches it after flush_checkpoints() (see header note).
+        if (pc.slot == nullptr || pc.ckpt.data.empty() || pc.ckpt.n_tokens != pc.n_tokens_expected) {
+            LOG_ERR("slot id %2d | task %d | dropping malformed pending checkpoint (n_tokens=%" PRId64 ", expected=%" PRId64 ", bytes=%zu)\n",
+                pc.id_slot, pc.id_task, pc.ckpt.n_tokens, pc.n_tokens_expected, pc.ckpt.data.size());
+            std::lock_guard<std::mutex> lock(checkpoint_mutex);
+            checkpoint_processing = false;
+            if (checkpoint_queue.empty()) {
+                checkpoint_idle_cv.notify_all();
+            }
+            continue;
+        }
+
+        server_slot & slot = *pc.slot;
+        auto & ckpts = slot.server_cached_prompt.checkpoints;
+        while (!ckpts.empty() && ckpts.size() >= pc.ctx_checkpoints_n) {
+            auto it = ckpts.begin();
+            if (pc.eviction_mode == COMMON_CHECKPOINT_EVICTION_VARIANCE ||
+                pc.eviction_mode == COMMON_CHECKPOINT_EVICTION_AUTO) {
+                it = evict_checkpoint_by_variance(slot, ckpts);
+            }
+            const auto & cur = *it;
+            LOG_WRN("slot id %2d | task %d | erased old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                pc.id_slot, pc.id_task, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+            ckpts.erase(it);
+        }
+
+        ckpts.emplace_back(std::move(pc.ckpt));
+        const auto & added = ckpts.back();
+        LOG_WRN("slot id %2d | task %d | checkpoint host-commit: %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+            pc.id_slot, pc.id_task, (int) ckpts.size(), (int) pc.ctx_checkpoints_n, added.pos_min, added.pos_max, added.n_tokens, (float) added.data.size() / 1024 / 1024);
+
+        {
+            std::lock_guard<std::mutex> lock(checkpoint_mutex);
+            checkpoint_processing = false;
+            if (checkpoint_queue.empty()) {
+                checkpoint_idle_cv.notify_all();
+            }
+        }
+    }
+}
+
 bool server_context::create_checkpoint(server_slot & slot) {
+    // Ensure any previously-queued commit has landed before we read/decide against the list, so the
+    // main thread and the worker never touch a slot's checkpoints list concurrently.
+    flush_checkpoints();
+
     bool do_checkpoint = !slot.image_just_processed;
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
@@ -3728,25 +3873,24 @@ bool server_context::create_checkpoint(server_slot & slot) {
 
     if (do_checkpoint) {
         const int64_t t_start = ggml_time_us();
-        while (slot.server_cached_prompt.checkpoints.size() >= (size_t)params_base.ctx_checkpoints_n) {
-            // make room for the new checkpoint, if needed
-            auto it = slot.server_cached_prompt.checkpoints.begin();
-            if (params_base.ctx_checkpoint_eviction == COMMON_CHECKPOINT_EVICTION_VARIANCE ||
-                params_base.ctx_checkpoint_eviction == COMMON_CHECKPOINT_EVICTION_AUTO) {
-                it = evict_checkpoint_by_variance(slot, slot.server_cached_prompt.checkpoints);
-            } 
-            const auto & cur = *it;
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
-            slot.server_cached_prompt.checkpoints.erase(it);
-        }
+        const int64_t n_tokens = slot.cache_tokens.n_tokens();
 
-        auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
-        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max, slot.n_past_offset);
+        pending_checkpoint pc;
+        pc.slot              = &slot;
+        pc.ctx_checkpoints_n = (size_t) params_base.ctx_checkpoints_n;
+        pc.eviction_mode     = (int) params_base.ctx_checkpoint_eviction;
+        pc.id_slot           = slot.id;
+        pc.id_task           = slot.task ? slot.task->id : -1;
+        pc.n_tokens_expected = n_tokens;
 
-        SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
-            (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
-            (ggml_time_us() - t_start) / 1000.0);
+        // Serialize KV on this thread (required for hybrid/recurrent and to avoid racing
+        // speculative accept / seq_rm). Only the host-side list commit is asynchronous.
+        server_prompt_checkpoint_update(pc.ckpt, ctx, slot.id, n_tokens, pos_min, pos_max, slot.n_past_offset);
+
+        SLT_WRN(slot, "context checkpoint serialized (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms); host commit queued\n",
+            pc.ckpt.pos_min, pc.ckpt.pos_max, pc.ckpt.n_tokens, (float) pc.ckpt.data.size() / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0);
+
+        enqueue_checkpoint(std::move(pc));
     }
     return do_checkpoint;
 }
@@ -3972,6 +4116,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                 // keep only the common part
                 // remove the non-common part from the cache
+                // Trim/seq_cp mutates this sequence; drain host-commit worker first.
+                flush_checkpoints();
                 if (slot.n_past < 0)
                 {
                     slot.n_past = 0;
@@ -4000,6 +4146,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_se = 0;
                     slot.n_prompt_tokens_cache = 0;
                     slot.ga_i = 0;
+                    flush_checkpoints();
                     slot.server_cached_prompt.checkpoints.clear();
                     // TODO: is the system prompt ever in the sampling context?
                     common_sampler_reset(slot.ctx_sampling);
@@ -4140,6 +4287,10 @@ void server_context::extend_context(const int32_t n_tokens) {
         if (slot.ga_n != 1) {
             // context extension via Self-Extend
             // TODO: simplify and/or abstract this
+            // RoPE K-shift rewrites committed K cells; drain host-commit worker first.
+            if (slot.n_past_se >= slot.ga_i + slot.ga_w) {
+                flush_checkpoints();
+            }
             while (slot.n_past_se >= slot.ga_i + slot.ga_w) {
                 const int ib = (slot.ga_n * slot.ga_i) / slot.ga_w;
                 const int bd = (slot.ga_w / slot.ga_n) * (slot.ga_n - 1);
@@ -4297,7 +4448,8 @@ bool server_context::accept_special_token(const server_slot& slot, const  llama_
 void server_context::release_slot_after_final_response(server_slot & slot) {
     slot.print_timings();
     if (params_base.do_checkpoint) {
-        create_checkpoint(slot);
+        // Durably commit before the slot goes idle / prompt-cache save.
+        (void) create_checkpoint_committed(slot);
     }
     slot.release();
     slot.released = true;
@@ -4466,6 +4618,8 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.n_past = slot.cache_tokens.n_tokens();
 
     // Remove from KV cache
+    // seq_rm removes tail cells; caller must flush_checkpoints() before rewind_context()
+    // (free function without server_context access).
     llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
 
     // Truncate buffer
@@ -4519,6 +4673,8 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
     }
 
     if (ban_pos >= 0 && allow_rewind) {
+        // rewind_context() seq_rm's tail cells; drain host-commit worker first.
+        flush_checkpoints();
         rewind_context(slot, ban_pos);
         slot.rewind_status = true;
     }
@@ -4654,7 +4810,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 // save checkpoint during prompt processing
                 if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                     if (slot.do_checkpoint) {
-                        create_checkpoint(slot);
+                        (void) create_checkpoint_committed(slot);
                     } else {
                         create_checkpoint_at_interval(slot, params_base);
                     }
@@ -4727,7 +4883,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 metrics.on_prompt_eval(slot);
                 // create checkpoint after prompt processing ends
                 if (params_base.ctx_checkpoints_tolerance<=0 && params_base.do_checkpoint) {
-                    create_checkpoint(slot);
+                    (void) create_checkpoint_committed(slot);
                 }
             }
 
