@@ -2407,9 +2407,7 @@ bool create_tensors_helper::create_dspark_tensors(const LLM_TN & tn) {
         model.dspark_confidence_head_b = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "bias"),   {1},         llama_model_loader::TENSOR_NOT_REQUIRED);
     }
 
-    // GIDD log-SNR conditioning (LogSnrEmbed): unlike markov_head/confidence_head above,
-    // this DOES change the draft embedding every forward pass once implemented, so when
-    // the GGUF says log_snr_conditioning is on these weights are required.
+    // GIDD log-SNR conditioning (LogSnrEmbed): wired into build_dspark(); required when enabled.
     if (hparams.dspark_log_snr_conditioning) {
         const int64_t n_freq = 128; // sinusoidal feature count (LogSnrEmbed)
         model.dspark_log_snr_fc1   = create_tensor(ctx_output, tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), {n_freq, n_embd}, 0);

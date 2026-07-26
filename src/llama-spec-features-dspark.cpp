@@ -14,7 +14,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <vector>
 
 static bool llama_model_is_dspark(const struct llama_model * model) {
     return model != nullptr && model->arch == LLM_ARCH_DSPARK;
@@ -241,8 +243,6 @@ void llama_reset_dspark_ctx(struct llama_context * ctx) {
 }
 
 bool llama_prepare_dspark_graph_inputs(struct llama_context & lctx, uint32_t n_tokens) {
-    GGML_UNUSED(n_tokens);
-
     ggml_tensor * ctx_feat_tensor = lctx.dspark.ctx_feat_tensor;
     ggml_tensor * ctx_pos_tensor  = lctx.dspark.ctx_pos_tensor;
     if (ctx_feat_tensor == nullptr || ctx_pos_tensor == nullptr) {
@@ -271,6 +271,43 @@ bool llama_prepare_dspark_graph_inputs(struct llama_context & lctx, uint32_t n_t
         std::vector<int32_t> zero_pos((size_t) ggml_nelements(ctx_pos_tensor), 0);
         ggml_backend_tensor_set(ctx_feat_tensor, zero_feat.data(), 0, ggml_nbytes(ctx_feat_tensor));
         ggml_backend_tensor_set(ctx_pos_tensor, zero_pos.data(), 0, ggml_nbytes(ctx_pos_tensor));
+    }
+
+    // GIDD LogSnrEmbed: host-side sinusoidal featurization matching Prism
+    // src/models/dspark.cpp (anchor pos % block_size == 0 → max_log_snr, else min).
+    ggml_tensor * log_snr_feat = lctx.dspark.log_snr_feat_tensor;
+    if (log_snr_feat != nullptr) {
+        const llama_hparams & hp = lctx.model.hparams;
+        const int64_t n_freq = log_snr_feat->ne[0];
+        const int64_t n_draft = log_snr_feat->ne[1];
+        if (n_freq != 128) {
+            LLAMA_LOG_ERROR("%s: unexpected LogSnrEmbed n_freq=%lld (expected 128)\n",
+                    __func__, (long long) n_freq);
+            return false;
+        }
+        if (n_tokens > 0 && (int64_t) n_tokens != n_draft) {
+            LLAMA_LOG_ERROR("%s: LogSnrEmbed n_draft mismatch (n_tokens=%u tensor=%lld)\n",
+                    __func__, n_tokens, (long long) n_draft);
+            return false;
+        }
+
+        const int64_t half    = n_freq / 2;
+        const float   min_snr = hp.dspark_min_log_snr;
+        const float   max_snr = hp.dspark_max_log_snr;
+        const int64_t bsz     = hp.dspark_block_size > 0 ? (int64_t) hp.dspark_block_size : n_draft;
+
+        std::vector<float> feat((size_t) (n_freq * n_draft));
+        for (int64_t pos = 0; pos < n_draft; ++pos) {
+            const float log_snr = (pos % bsz == 0) ? max_snr : min_snr;
+            const float t       = (log_snr - min_snr) / (max_snr - min_snr) * 1000.0f;
+            for (int64_t i = 0; i < half; ++i) {
+                const float freq  = expf(-logf(10000.0f) * (float) i / (float) half);
+                const float angle = t * freq;
+                feat[(size_t) (pos * n_freq + i)]        = sinf(angle);
+                feat[(size_t) (pos * n_freq + half + i)] = cosf(angle);
+            }
+        }
+        ggml_backend_tensor_set(log_snr_feat, feat.data(), 0, ggml_nbytes(log_snr_feat));
     }
 
     return true;

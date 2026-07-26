@@ -413,6 +413,8 @@ struct llama_context {
         // staged `ctx` data by llama_prepare_dspark_graph_inputs() right before compute.
         struct ggml_tensor * ctx_feat_tensor = nullptr; // F32 [n_embd_cap, n_ctx_rows]
         struct ggml_tensor * ctx_pos_tensor  = nullptr; // I32 [n_ctx_rows]
+        // GIDD LogSnrEmbed sinusoidal features [n_freq=128, n_draft]; filled in prepare.
+        struct ggml_tensor * log_snr_feat_tensor = nullptr; // F32 [128, n_tokens] or null if unused
     };
     dspark_runtime dspark;
 

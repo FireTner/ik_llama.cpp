@@ -30,11 +30,14 @@
 //      naive port that computes then discards context-row attention output). Attention is a
 //      single, fully non-causal softmax (no mask at all: every draft row attends to the full
 //      concatenated K/V, including every other draft row).
-//   4. lm_head over the draft rows. Two auxiliary heads (markov_head_a/b, confidence_head) plus
-//      optional GIDD log-SNR conditioning (log_snr_fc1/fc2) are loaded (llama-load-tensors.cpp)
-//      but not built into this graph -- markov resampling is a host-side, sequential block-
-//      diffusion loop (see common/speculative-dspark-impl.h) that is out of scope for this
-//      single forward pass, same as upstream Prism itself defers it out of the graph.
+//   4. Optional GIDD LogSnrEmbed (log_snr_fc1/fc2): sinusoidal features of the fixed
+//      round-1 anchor/mask log-SNR pattern are staged as a graph input, then
+//      fc1 → SiLU → fc2 and added to the draft token embeddings BEFORE the layer loop
+//      (matches Prism src/models/dspark.cpp). Without this, GGUFs trained with
+//      log_snr_conditioning=true draft from the wrong embedding.
+//   5. lm_head over the draft rows. Auxiliary heads (markov_head_a/b, confidence_head) are
+//      loaded but not built into this graph -- markov resampling is a host-side sequential
+//      block-diffusion loop (common/speculative-dspark-impl.h), same as upstream Prism.
 //
 // Unlike build_dflash(), there is no persistent per-layer K/V cache here: the target-tap
 // projection is small and recomputed fresh on every call (exactly what the upstream reference
@@ -52,11 +55,10 @@ ggml_cgraph * llm_build_context::build_dspark() {
     GGML_ASSERT(hparams.dspark_block_size > 1);
     GGML_ASSERT(model.dspark_fc != nullptr);
     GGML_ASSERT(model.dspark_hidden_norm != nullptr);
-    // GIDD log-SNR conditioning (log_snr_fc1/fc2) changes the draft embedding every forward
-    // pass in the upstream reference; it isn't built into this graph yet, so fail loudly
-    // instead of silently drafting with the wrong embedding for a model that needs it.
-    GGML_ASSERT(!hparams.dspark_log_snr_conditioning &&
-            "DSpark GIDD log-SNR conditioning is not implemented in build_dspark() yet");
+    if (hparams.dspark_log_snr_conditioning) {
+        GGML_ASSERT(model.dspark_log_snr_fc1 != nullptr && model.dspark_log_snr_fc1_b != nullptr);
+        GGML_ASSERT(model.dspark_log_snr_fc2 != nullptr && model.dspark_log_snr_fc2_b != nullptr);
+    }
 
     // Width of the staged target-tap context window (see llama_set_dspark_ctx() /
     // llama-spec-features-dspark.cpp). Zero during buffer-reserve/warmup trial graph builds that
@@ -78,6 +80,8 @@ ggml_cgraph * llm_build_context::build_dspark() {
     ggml_set_input(lctx.dspark.ctx_pos_tensor);
     cb(lctx.dspark.ctx_pos_tensor, "dspark_ctx_pos", -1);
 
+    lctx.dspark.log_snr_feat_tensor = nullptr;
+
     // fc + hidden_norm are applied ONCE for the whole call; the result is re-projected fresh
     // through each layer's own k_proj/v_proj below (it never itself passes through a layer's
     // attn_norm/FFN -- see file header).
@@ -88,6 +92,30 @@ ggml_cgraph * llm_build_context::build_dspark() {
 
     // --- draft-block token embeddings (the trunk residual stream) ---
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+    // --- GIDD log-SNR conditioning (LogSnrEmbed), Prism-compatible ---
+    // Added to draft embeddings BEFORE the layer loop. Sinusoidal features are a pure function
+    // of n_tokens / block_size / min/max_log_snr (anchor → max, mask → min); filled by
+    // llama_prepare_dspark_graph_inputs().
+    if (hparams.dspark_log_snr_conditioning) {
+        const int64_t n_freq = 128;
+        lctx.dspark.log_snr_feat_tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_freq, n_tokens);
+        ggml_set_input(lctx.dspark.log_snr_feat_tensor);
+        cb(lctx.dspark.log_snr_feat_tensor, "dspark_log_snr_feat", -1);
+
+        ggml_tensor * snr_hidden = llm_build_lora_mm(lctx, ctx0, model.dspark_log_snr_fc1, lctx.dspark.log_snr_feat_tensor);
+        snr_hidden = ggml_add(ctx0, snr_hidden, model.dspark_log_snr_fc1_b);
+        snr_hidden = ggml_silu(ctx0, snr_hidden);
+        cb(snr_hidden, "dspark_log_snr_fc1", -1);
+
+        ggml_tensor * snr_embed = llm_build_lora_mm(lctx, ctx0, model.dspark_log_snr_fc2, snr_hidden);
+        snr_embed = ggml_add(ctx0, snr_embed, model.dspark_log_snr_fc2_b);
+        cb(snr_embed, "dspark_log_snr_fc2", -1);
+
+        inpL = ggml_add(ctx0, inpL, snr_embed);
+        cb(inpL, "dspark_draft_embd_snr", -1);
+    }
+
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = (n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
 
