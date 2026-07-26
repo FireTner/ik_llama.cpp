@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Path to your GGUF model
-MODEL_DIR="$HOME/.lmstudio/models/Danny-Dasilva/Bonsai-27B-antidoom-1bit-DSpark"
-MODEL_PATH="$MODEL_DIR/Bonsai-27B-antidoom-1bit-Q1_0.gguf"
+MODEL_DIR="$HOME/.lmstudio/models/prism-ml/Bonsai-27B-gguf"
+MODEL_PATH="$MODEL_DIR/Bonsai-27B-Q1_0.gguf"
 DRAFT_PATH="$MODEL_DIR/Bonsai-27B-dspark-Q4_1.gguf"
 
 # Verify model file exists
@@ -17,66 +17,126 @@ fi
 # export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 export CUDA_MODULE_LOADING=LAZY
 
-# --- VRAM notes (RTX 4060 Laptop 8GB, ~1GB desktop headroom) ---
-# Main Q1 GGUF ≈ 4.35 GiB. 64k q4_0 KV is the squeeze.
-# DSpark Q4_1 drafter ≈ 1.8 GiB extra — often will not fit with full -ngl + 64k.
-# Fallback order (never UVM):
-#   1) keep -c 65536, drop DSpark / lower -ngld
-#   2) --fit + --fit-margin, or slightly lower -ngl
-#   3) only then shrink -c for diagnosis
+# --- Hermès needs -c 65536. Do not shrink CTX. ---
+# Full @64k: w4270 + KV1301 + c252 ≈ 5.8 GiB → ~5960 in nvidia-smi; ~1GB free w/ desktop.
+# NEVER -ngl ≤64: parks output on CPU, compute 252→1247 (VRAM wash + slower tg).
 #
-# DSpark (opt-in): USE_DSPARK=1 ./run_bon.sh
-# Requires: Bonsai-27B-dspark-Q4_1.gguf next to the main model.
-# Download:
+# VRAM for DSpark @64k (only clean levers left):
+#   CPU_LAYERS=0-N  → -ot early blk.* to CPU, keep -ngl 99 (output stays GPU); ~51 MiB/layer
+#                     0-11 ≈ 0.6 GiB, 0-19 ≈ 1.0 GiB. Default 0-15 only when DSpark actually loads.
+#   quit Vesktop/Brave → ~300–400 MiB desktop
+#   -ngld low + -cd 4096 → draft KV tiny; unique draft weights often ~0.5 GiB if shared
+# Never UVM. Never trade away 64k for Hermès.
+#
+#   USE_DSPARK=1 ./run_bon.sh
+#   CPU_LAYERS=0-19 USE_DSPARK=1 ./run_bon.sh   # more headroom if OOM
+#   CPU_LAYERS=0 USE_DSPARK=1 ./run_bon.sh      # set 0 to disable layer park
+#
+# Download drafter (~1.8G; ~3.5G free on /home):
 #   huggingface-cli download Danny-Dasilva/Bonsai-27B-antidoom-1bit-DSpark \
 #     Bonsai-27B-dspark-Q4_1.gguf --local-dir "$MODEL_DIR"
 USE_DSPARK="${USE_DSPARK:-0}"
+CTX=65536
 
+# Resolve DSpark first so a missing drafter does not still apply CPU layer parking.
 DSPARK_ARGS=()
+DSPARK_ACTIVE=0
 if [ "$USE_DSPARK" = "1" ]; then
     if [ ! -f "$DRAFT_PATH" ]; then
-        echo "USE_DSPARK=1 but drafter not found:"
-        echo "  $DRAFT_PATH"
-        echo "Download with:"
+        echo "USE_DSPARK=1 but drafter not found: $DRAFT_PATH"
         echo "  huggingface-cli download Danny-Dasilva/Bonsai-27B-antidoom-1bit-DSpark \\"
         echo "    Bonsai-27B-dspark-Q4_1.gguf --local-dir \"$MODEL_DIR\""
-        echo "Continuing without DSpark (main model only, 64k)."
+        echo "Continuing without DSpark (no default CPU layer park)."
     else
-        # ik flag: --spec-type draft-dspark:n_max=4 (not Prism's --spec-draft-n-max)
-        # -np 1: DSpark disables cross-request prompt-cache reuse
-        # Prefer lowering -ngld before -ngl / -c if OOM
+        DSPARK_ACTIVE=1
+        # 64k main KV already heavy — keep draft ctx small; start conservative on -ngld.
+        NGLD="${NGLD:-20}"
+        CD="${CD:-4096}"
         DSPARK_ARGS+=(
             -md "$DRAFT_PATH"
-            -ngld 99
+            -ngld "$NGLD"
+            -cd "$CD"
             --spec-type draft-dspark:n_max=4
+            --spec-autotune
             -np 1
         )
-        echo "==> DSpark enabled: $DRAFT_PATH"
+        echo "==> DSpark @64k: $DRAFT_PATH (-ngld $NGLD, -cd $CD). Raise NGLD if VRAM allows."
     fi
 fi
 
-echo "==> Launching llama-server with hardware optimizations..."
+# Default park blk.0-15 only when DSpark is actually active. Explicit CPU_LAYERS always wins;
+# CPU_LAYERS=0 disables parking.
+if [ "$DSPARK_ACTIVE" = "1" ]; then
+    CPU_LAYERS="${CPU_LAYERS:-0-15}"
+else
+    CPU_LAYERS="${CPU_LAYERS:-}"
+fi
+if [ "$CPU_LAYERS" = "0" ]; then
+    CPU_LAYERS=""
+fi
 
-# Was: -b 2048 -ub 2048 — cut batch only; keep 64k for Hermes.
-# -khad/-vhad: Hadamard before q4 KV (better quality @ same VRAM; ik TurboQuant alt).
-# Was: --ctx-checkpoints 0 — killed hybrid restore; Hermès re-PP'd ~20k every tool turn.
-# Now 32: recurrent/SSM checkpoints so multi-turn can resume (see docs/parameters.md).
-# If OOM without UVM: try -c 8192 briefly to confirm GPU residency, then raise.
+OT_ARGS=()
+if [ -n "$CPU_LAYERS" ]; then
+    if [[ "$CPU_LAYERS" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+        seq_re=$(seq -s '|' "$lo" "$hi")
+        OT_ARGS+=(-ot "^blk\\.(${seq_re})\\..*=CPU")
+        echo "==> Hermès 64k: parking blk.${lo}-${hi}.* on CPU (~$(( (hi - lo + 1) * 51 )) MiB), output stays GPU"
+    else
+        echo "CPU_LAYERS must look like 0-15 (got: $CPU_LAYERS)"; exit 1
+    fi
+fi
+
+# Batch sizes. Defaults (-b 512 -ub 256) were chosen to avoid OOM on the full-GPU stack.
+# DSpark IO-tensor sharing frees ~1.2-1.4 GiB by aliasing the drafter's token_embd/output to the
+# target's, so a larger -ub (e.g. UBATCH=512) can speed up prompt processing when VRAM allows.
+# Only raise UBATCH within available VRAM headroom (watch nvidia-smi / load-log compute buffer);
+# too large will OOM at 64k. Keep BATCH >= UBATCH.
+#   BATCH=512 UBATCH=512 USE_DSPARK=1 ./run_bon.sh
+BATCH="${BATCH:-512}"
+UBATCH="${UBATCH:-256}"
+
+# Prompt cache (host RAM). ik default is 8192 MiB — on 14 GiB RAM that fills during Hermès
+# multi-turn (full KV snapshots + embedded ctx-checkpoints), then kswapd OOM-kills llama-server
+# even though load looked fine. Default OFF on this machine. Raise only with spare RAM:
+#   CACHE_RAM=512 ./run_bon.sh
+CACHE_RAM="${CACHE_RAM:-0}"
+
+# Context checkpoints also live in host RAM (needed for Qwen3.5 / Hermès tool turns).
+# 32 is fine if each is small (PARTIAL_ONLY); lower if host RSS still climbs.
+#   CTX_CHECKPOINTS=8 ./run_bon.sh
+CTX_CHECKPOINTS="${CTX_CHECKPOINTS:-16}"
+
+LOG_FILE="${LOG_FILE:-/tmp/run_bon.log}"
+
+echo "==> Launching llama-server"
+echo "    -c $CTX  -ngl 99  -b $BATCH -ub $UBATCH"
+echo "    --cache-ram $CACHE_RAM  --ctx-checkpoints $CTX_CHECKPOINTS"
+echo "    log: $LOG_FILE"
+echo "    VERIFY: startup must print: prompt cache is disabled   OR   size limit: ${CACHE_RAM} MiB"
+if [ "$DSPARK_ACTIVE" = "1" ]; then
+    echo "    VERIFY: load log should mention DSpark skipping drafter token_embd/output (IO share)"
+fi
+
+# shellcheck disable=SC2086
 ./build/bin/llama-server \
     -m "$MODEL_PATH" \
     -ngl 99 \
-    -c 65536 \
-    -b 512 \
-    -ub 256 \
+    "${OT_ARGS[@]}" \
+    -c "$CTX" \
+    -b "$BATCH" \
+    -ub "$UBATCH" \
     -fa on \
     --cache-type-k q4_0 \
     --cache-type-v q4_0 \
     -khad \
     -vhad \
-    --ctx-checkpoints 32 \
+    --ctx-checkpoints "$CTX_CHECKPOINTS" \
+    --cache-ram "$CACHE_RAM" \
     --graph-reuse \
     --jinja \
     -t 6 \
     -tb 12 \
     --port 8080 \
-    "${DSPARK_ARGS[@]}"
+    "${DSPARK_ARGS[@]}" \
+    2>&1 | tee "$LOG_FILE"
