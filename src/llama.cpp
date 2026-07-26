@@ -3734,7 +3734,12 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             name == "rope_freqs.weight") {
             continue;
         }
-        if (name == "dflash_fc.weight" || name == "dflash_hidden_norm.weight") {
+        if (name == "dflash_fc.weight" || name == "dflash_hidden_norm.weight" ||
+            name == "dspark.fc.weight" || name == "dspark.hidden_norm.weight" ||
+            name == "dspark.markov_head_a.weight" || name == "dspark.markov_head_b.weight" ||
+            name == "dspark.confidence_head.weight" || name == "dspark.confidence_head.bias" ||
+            name == "dspark.log_snr_fc1.weight" || name == "dspark.log_snr_fc1.bias" ||
+            name == "dspark.log_snr_fc2.weight" || name == "dspark.log_snr_fc2.bias") {
             output_misc_size += size;
             continue;
         }
