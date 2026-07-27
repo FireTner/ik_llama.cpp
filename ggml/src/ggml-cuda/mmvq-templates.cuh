@@ -281,10 +281,16 @@ static __device__ void k_fused_mul_mat_vec_q(
     }
 }
 
+// Q1_0_G128 mat-vec is latency bound (NCU: ~60% SM, ~55% DRAM, 47-62% warps active,
+// occupancy capped at 9 blocks/SM by 53 registers), so cap registers to raise occupancy.
+static constexpr int mmvq_min_blocks(ggml_type type) {
+    return type == GGML_TYPE_Q1_0_G128 ? 12 : 1;
+}
+
 template <ggml_type type, int ncols_y, int nwarps>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
-__launch_bounds__(nwarps*WARP_SIZE, 1)
+__launch_bounds__(nwarps*WARP_SIZE, mmvq_min_blocks(type))
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 static __global__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
@@ -307,7 +313,7 @@ static __global__ void mul_mat_vec_q(
 template <ggml_type type, int ncols_y, int nwarps>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
-__launch_bounds__(nwarps*WARP_SIZE, 1)
+__launch_bounds__(nwarps*WARP_SIZE, mmvq_min_blocks(type))
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 static __global__ void fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
