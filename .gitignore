@@ -22,6 +22,10 @@
 *.tmp
 *.DS_Store
 
+# Local-only (machine findings, not for GitHub)
+
+.local/
+
 # IDE / OS
 
 .cache/
