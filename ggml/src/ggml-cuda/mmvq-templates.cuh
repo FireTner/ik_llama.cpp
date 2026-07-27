@@ -79,13 +79,11 @@ static __device__ void k_mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
-    //    ncols_y < 4 ? 1 : 2 : 1;
-
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    // Q1: always 2 rows/block so q8_1 activations load once and feed both output rows.
+    constexpr int rows_per_cuda_block = type == GGML_TYPE_Q1_0_G128 ? 2 : (ncols_y < 4 ? 1 : 2);
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -105,11 +103,21 @@ static __device__ void k_mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+        if constexpr (type == GGML_TYPE_Q1_0_G128 && rows_per_cuda_block == 2) {
 #pragma unroll
-        for (int j = 0; j < ncols_y; ++j) {
+            for (int j = 0; j < ncols_y; ++j) {
+                vec_dot_q1_0_g128_q8_1_rows2(vx, &y[j*blocks_per_col_y + kby],
+                        (row0 + 0)*blocks_per_row_x + kbx,
+                        (row0 + 1)*blocks_per_row_x + kbx,
+                        kqs, tmp[j][0], tmp[j][1]);
+            }
+        } else {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                }
             }
         }
     }
@@ -164,13 +172,11 @@ static __device__ void k_fused_mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
-    //    ncols_y < 4 ? 1 : 2 : 1;
-
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    // Q1: always 2 rows/block so q8_1 activations load once and feed both output rows.
+    constexpr int rows_per_cuda_block = type == GGML_TYPE_Q1_0_G128 ? 2 : (ncols_y < 4 ? 1 : 2);
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -199,12 +205,26 @@ static __device__ void k_fused_mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+        if constexpr (type == GGML_TYPE_Q1_0_G128 && rows_per_cuda_block == 2) {
 #pragma unroll
-        for (int j = 0; j < ncols_y; ++j) {
+            for (int j = 0; j < ncols_y; ++j) {
+                vec_dot_q1_0_g128_q8_1_rows2(vup,   &y[j*blocks_per_col_y + kby],
+                        (row0 + 0)*blocks_per_row_x + kbx,
+                        (row0 + 1)*blocks_per_row_x + kbx,
+                        kqs, tmp_u[j][0], tmp_u[j][1]);
+                vec_dot_q1_0_g128_q8_1_rows2(vgate, &y[j*blocks_per_col_y + kby],
+                        (row0 + 0)*blocks_per_row_x + kbx,
+                        (row0 + 1)*blocks_per_row_x + kbx,
+                        kqs, tmp_g[j][0], tmp_g[j][1]);
+            }
+        } else {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_u[j][i] += vec_dot_q_cuda(vup  , &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
-                tmp_g[j][i] += vec_dot_q_cuda(vgate, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp_u[j][i] += vec_dot_q_cuda(vup  , &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                    tmp_g[j][i] += vec_dot_q_cuda(vgate, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                }
             }
         }
     }
@@ -346,7 +366,7 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     int id = ggml_cuda_get_device();
 
     int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
-        args.ncols_y < 4 ? 1 : 2 : 1;
+        (type == GGML_TYPE_Q1_0_G128 ? 2 : (args.ncols_y < 4 ? 1 : 2)) : 1;
 
     const int64_t nblocks = (args.nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
     const dim3 block_nums(nblocks, args.ne2, 1);

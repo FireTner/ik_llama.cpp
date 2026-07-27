@@ -621,6 +621,76 @@ static __device__ __forceinline__ float vec_dot_q1_0_g128_q8_1(
     return d1 * sumf;
 }
 
+// Dot two Q1 rows against the same q8_1 activation (load y once).
+static __device__ __forceinline__ void vec_dot_q1_0_g128_q8_1_rows2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx0, const int & kbx1, const int & iqs, float & sum0, float & sum1) {
+
+    const block_q1_0_g128 * b0 = (const block_q1_0_g128 *) vbq + kbx0;
+    const block_q1_0_g128 * b1 = (const block_q1_0_g128 *) vbq + kbx1;
+    const float d0 = b0->d;
+    const float d1 = b1->d;
+    const int16_t * qs0 = (const int16_t *) b0->qs + iqs * 2;
+    const int16_t * qs1 = (const int16_t *) b1->qs + iqs * 2;
+
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+
+#pragma unroll
+    for (int c = 0; c < VDR_Q1_0_G128_Q8_1_MMVQ; ++c) {
+        const block_q8_1 * by = bq8_1 + iqs + c;
+        const float d8 = __low2float(by->ds);
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int u0 = get_int_b4(by->qs, j*4+0);
+            const int u1 = get_int_b4(by->qs, j*4+1);
+            const int u2 = get_int_b4(by->qs, j*4+2);
+            const int u3 = get_int_b4(by->qs, j*4+3);
+
+            const int q0 = qs0[2*c + j];
+            const int n00 = __byte_perm(0x11100100, 0x11100100, q0 >> 0);
+            const int n01 = __byte_perm(0x11100100, 0x11100100, q0 >> 2);
+            const int s00 = __byte_perm(0x01FF, 0x01FF, n00 >>  0);
+            const int s01 = __byte_perm(0x01FF, 0x01FF, n01 >>  0);
+            const int s02 = __byte_perm(0x01FF, 0x01FF, n00 >> 16);
+            const int s03 = __byte_perm(0x01FF, 0x01FF, n01 >> 16);
+            const int v00 = __byte_perm(s00, s01, 0x5410);
+            const int v01 = __byte_perm(s00, s01, 0x7632);
+            const int v02 = __byte_perm(s02, s03, 0x5410);
+            const int v03 = __byte_perm(s02, s03, 0x7632);
+            sumi0 = ggml_cuda_dp4a(v00, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(v01, u1, sumi0);
+            sumi0 = ggml_cuda_dp4a(v02, u2, sumi0);
+            sumi0 = ggml_cuda_dp4a(v03, u3, sumi0);
+
+            const int q1 = qs1[2*c + j];
+            const int n10 = __byte_perm(0x11100100, 0x11100100, q1 >> 0);
+            const int n11 = __byte_perm(0x11100100, 0x11100100, q1 >> 2);
+            const int s10 = __byte_perm(0x01FF, 0x01FF, n10 >>  0);
+            const int s11 = __byte_perm(0x01FF, 0x01FF, n11 >>  0);
+            const int s12 = __byte_perm(0x01FF, 0x01FF, n10 >> 16);
+            const int s13 = __byte_perm(0x01FF, 0x01FF, n11 >> 16);
+            const int v10 = __byte_perm(s10, s11, 0x5410);
+            const int v11 = __byte_perm(s10, s11, 0x7632);
+            const int v12 = __byte_perm(s12, s13, 0x5410);
+            const int v13 = __byte_perm(s12, s13, 0x7632);
+            sumi1 = ggml_cuda_dp4a(v10, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(v11, u1, sumi1);
+            sumi1 = ggml_cuda_dp4a(v12, u2, sumi1);
+            sumi1 = ggml_cuda_dp4a(v13, u3, sumi1);
+        }
+
+        s0 += d8 * sumi0;
+        s1 += d8 * sumi1;
+    }
+
+    sum0 += d0 * s0;
+    sum1 += d1 * s1;
+}
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
