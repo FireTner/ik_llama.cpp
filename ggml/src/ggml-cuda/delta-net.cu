@@ -6,10 +6,6 @@
 // Delta Net Linear Attention Kernel for Qwen3-Next (HEAD_DIM=128)
 // State layout: [S_v, S_v*H_v, 1, n_seqs] (column-major)
 
-__device__ __forceinline__ float sigmoid_f(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
 template <int block_size>
 __device__ __forceinline__ float reduce_sum(float x, float * s) {
     x = warp_reduce_sum(x);
@@ -28,6 +24,9 @@ __device__ __forceinline__ float reduce_sum(float x, float * s) {
 }
 
 template <int HEAD_DIM, int block_size>
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+__launch_bounds__(block_size, block_size >= 256 ? 6 : 8)
+#endif
 __global__ void delta_net_recurrent_f32(
     const float * __restrict__ q,         // [HEAD_DIM, n_tokens, n_heads, n_seqs]
     const float * __restrict__ k,         // [HEAD_DIM, n_tokens, n_heads, n_seqs]
@@ -60,13 +59,9 @@ __global__ void delta_net_recurrent_f32(
     const int64_t qkv_stride_batch_kq = qkv_stride_batch / gqa_ratio;
 
     // G/Beta: [n_tokens, 1, n_heads, n_seqs] / [1, n_tokens, n_heads, n_seqs]
-    //const int64_t g_stride_head = n_tokens;
     const int64_t g_stride_batch = n_tokens * n_heads;
 
     // State: [HEAD_DIM, HEAD_DIM*n_heads, 1, n_seqs]
-    // For head h: columns h*HEAD_DIM to (h+1)*HEAD_DIM
-    // state[row, col] for head h = state[row, h*HEAD_DIM + col]
-    // Linear index: row + (h*HEAD_DIM + col) * HEAD_DIM = row + h*HEAD_DIM^2 + col*HEAD_DIM
     const int64_t state_head_offset = head_idx * HEAD_DIM * HEAD_DIM;
     const int64_t state_batch_stride = HEAD_DIM * HEAD_DIM * n_heads;
 
@@ -82,12 +77,11 @@ __global__ void delta_net_recurrent_f32(
     const float * state_src = state_in + batch_idx * state_batch_stride + state_head_offset;
 
     // Output layout: [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
-    // For [dim, head, token, batch]: index = dim + head*S_v + token*S_v*H_v + batch*S_v*H_v*n_tokens
     float * out_base = dst + batch_idx * (HEAD_DIM * n_heads * n_tokens) + head_idx * HEAD_DIM;
     const int64_t out_token_stride = HEAD_DIM * n_heads;  // stride between tokens
     float * state_dst = dst + output_offset + batch_idx * state_batch_stride + state_head_offset;
 
-    // Shared memory for current token's Q, K, V (normalized), and intermediate results
+    // Shared memory for current token's Q, K
     extern __shared__ float smem[];
     float * sQ = smem;                          // HEAD_DIM
     float * sK = sQ + HEAD_DIM;                 // HEAD_DIM
@@ -103,6 +97,7 @@ __global__ void delta_net_recurrent_f32(
 
     // Keep the state in registers, copy the final state to its destination at the end
     float state_local[HEAD_DIM/num_warps];
+#pragma unroll
     for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
         int col = num_warps*i + col_idx_0;
         state_local[i] = state_src[col*HEAD_DIM + row_out];
@@ -114,8 +109,11 @@ __global__ void delta_net_recurrent_f32(
     auto all_sum1 = all_sum;
     auto all_sum2 = all_sum1 + WARP_SIZE_S*num_stored_rows;
 
-    for (int64_t t = 0; t < n_tokens; t++) {
+    // TG (n_tokens==1): one step, no loop-carry barrier; raises useful work vs prior waves~1.6.
+    const int64_t t_end = n_tokens;
+    for (int64_t t = 0; t < t_end; t++) {
         float sum_kq = 0.0f;
+#pragma unroll
         for (int i = tid; i < HEAD_DIM; i += block_size) {
             sQ[i] = q_ptr[t * qkv_stride_token + i] * scale;
             sK[i] = k_ptr[t * qkv_stride_token + i];
@@ -124,8 +122,8 @@ __global__ void delta_net_recurrent_f32(
 
         float attn_score = reduce_sum<block_size>(sum_kq, sum_helper);
 
-        float beta_val = sigmoid_f(beta_ptr[t*n_heads]);
-        float decay    = expf(fminf(g_ptr[t*n_heads], 50.0f));
+        float beta_val = 1.0f / (1.0f + __expf(-beta_ptr[t*n_heads]));
+        float decay    = __expf(fminf(g_ptr[t*n_heads], 50.0f));
 
         float sum1 = 0, sum2 = 0;
 #pragma unroll
@@ -146,12 +144,12 @@ __global__ void delta_net_recurrent_f32(
             sum2 += all_sum2[i*WARP_SIZE_S + row];
         }
 
-        //float sv_new = beta_val * (v_ptr[t * qkv_stride_token + row_out] - sum1 * decay);
         float sv_new = beta_val * (v_ptr[t * vnb1 + row_out] - sum1 * decay);
         if (col_idx_0 == 0) {
             out_base[t * out_token_stride + row_out] = sum2 * decay + sv_new * attn_score;
         }
 
+#pragma unroll
         for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
             int col = num_warps*i + col_idx_0;
             float new_state_val = decay * state_local[i] + sv_new * sK[col];
@@ -162,20 +160,20 @@ __global__ void delta_net_recurrent_f32(
         // Save per-step state if requested
         if (saved_states && t < n_tokens - 1) {
             float * state_step_dst = saved_states + batch_idx * state_batch_stride + state_head_offset + t * state_step_stride;
+#pragma unroll
             for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
                 int col = num_warps*i + col_idx_0;
                 state_step_dst[col*HEAD_DIM + row_out] = state_local[i];
             }
         }
 
-        // Barrier required: (a) sK reads in the state update above must complete
-        // before next iteration overwrites sK at the top of the loop, and (b) this
-        // single barrier also orders all_sum1/all_sum2 reads above vs. the next
-        // iteration's writes — subsuming the prior barriers after the cross-warp
-        // reduction and after the loop exit.
-        __syncthreads();
+        // Barrier required when another token follows: sK/all_sum must not be overwritten early.
+        if (t + 1 < n_tokens) {
+            __syncthreads();
+        }
     }
     // Copy the final state to its destination
+#pragma unroll
     for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
         int col = num_warps*i + col_idx_0;
         state_dst[col*HEAD_DIM + row_out] = state_local[i];
