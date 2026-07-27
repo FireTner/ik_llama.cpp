@@ -171,6 +171,7 @@ struct llama_hparams {
     uint32_t dflash_n_target_layers = 0;
     uint32_t dflash_target_layer_ids[8] = {};
     float    dflash_backbone_rotary_base = 0.0f;
+    bool     dflash_laguna = false;
 
     // DSpark draft model metadata (EAGLE-style block-diffusion drafter)
     uint32_t dspark_block_size = 0;
@@ -207,6 +208,7 @@ struct llama_hparams {
         if (this->dflash_mask_token_id != other.dflash_mask_token_id) return true;
         if (this->dflash_n_target_features != other.dflash_n_target_features) return true;
         if (this->dflash_n_target_layers != other.dflash_n_target_layers) return true;
+        if (this->dflash_laguna != other.dflash_laguna) return true;
         if (this->dspark_block_size != other.dspark_block_size) return true;
         if (this->dspark_mask_token_id != other.dspark_mask_token_id) return true;
         if (this->n_dspark_target_layers != other.n_dspark_target_layers) return true;

@@ -169,6 +169,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,           "%s.dflash.target_layer_ids"           },
     { LLM_KV_DFLASH_N_TARGET_FEATURES,          "%s.dflash.n_target_features"          },
     { LLM_KV_DFLASH_BACKBONE_ROTARY_BASE,       "%s.dflash.backbone_rotary_base"       },
+    { LLM_KV_DFLASH_LAGUNA,                     "%s.dflash.laguna"                     },
     // Nested under "%s.dspark.*" to match Prism GGUFs (same pattern as DFlash's "%s.dflash.*").
     { LLM_KV_DSPARK_BLOCK_SIZE,                  "%s.dspark.block_size"                 },
     { LLM_KV_DSPARK_MASK_TOKEN_ID,               "%s.dspark.mask_token_id"              },

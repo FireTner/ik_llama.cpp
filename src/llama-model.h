@@ -473,6 +473,7 @@ struct llama_model {
     struct ggml_tensor * mtp_centroids = nullptr;
     struct ggml_tensor * dflash_fc = nullptr;
     struct ggml_tensor * dflash_hidden_norm = nullptr;
+    std::vector<struct ggml_tensor *> dflash_aux_hidden_norms;
 
     // DSpark draft model tensors
     // When true, this (DSpark drafter) model's token_embd/output were intentionally NOT

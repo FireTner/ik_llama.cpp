@@ -3735,6 +3735,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             continue;
         }
         if (name == "dflash_fc.weight" || name == "dflash_hidden_norm.weight" ||
+            name.rfind("dflash_aux_hidden_norm.", 0) == 0 ||
             name == "dspark.fc.weight" || name == "dspark.hidden_norm.weight" ||
             name == "dspark.markov_head_a.weight" || name == "dspark.markov_head_b.weight" ||
             name == "dspark.confidence_head.weight" || name == "dspark.confidence_head.bias" ||
@@ -5861,7 +5862,7 @@ static int llama_decode_internal(
     const auto & hparams = model.hparams;
     const auto & cparams = lctx.cparams;
 
-    llama_begin_dflash_capture_batch(&lctx);
+    llama_begin_dflash_capture_batch(&lctx, (int32_t) n_tokens_all);
 
     GGML_ASSERT((!batch_all.token && batch_all.embd) || (batch_all.token && !batch_all.embd)); // NOLINT
 
@@ -6964,6 +6965,10 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         // TODO: extract to a function
         // build worst-case graph
         int n_tokens = (int)std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
+        // MTP draft generation consumes one token and one hidden-state vector per decode step.
+        if (lctx.cparams.mtp_op_type == MTP_OP_DRAFT_GEN) {
+            n_tokens = 1;
+        }
         int n_past = lctx.cparams.n_ctx - n_tokens;
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
