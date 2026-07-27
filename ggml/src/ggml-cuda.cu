@@ -4446,6 +4446,22 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
     return use_cuda_graph;
 }
 
+// Hot path under --graph-reuse: graph topology is stable, only CPY destinations change per token.
+static void refresh_cuda_graph_cpy_dest_ptrs(ggml_cuda_graph * graph, ggml_cgraph * cgraph, cudaStream_t stream) {
+    graph->cpy_dest_ptrs.clear();
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_noop(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_CPY) {
+            graph->cpy_dest_ptrs.push_back((char *) node->src[1]->data);
+        }
+    }
+    graph->use_cpy_indirection = true;
+    ggml_cuda_cpy_dest_ptrs_copy(graph, graph->cpy_dest_ptrs.data(), (int) graph->cpy_dest_ptrs.size(), stream);
+}
+
 static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
     graph_node_properties->node_address = node->data;
     graph_node_properties->node_op = node->op;
@@ -4662,7 +4678,12 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     if (use_cuda_graph) {
         cuda_graph_update_required = is_cuda_graph_update_required(graph, cgraph);
 
-        use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(graph, cgraph, use_cuda_graph, cuda_ctx->stream());
+        // Stable executable: skip full compatibility walk; only refresh CPY dest indirection.
+        if (!cuda_graph_update_required && graph->instance != nullptr) {
+            refresh_cuda_graph_cpy_dest_ptrs(graph, cgraph, cuda_ctx->stream());
+        } else {
+            use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(graph, cgraph, use_cuda_graph, cuda_ctx->stream());
+        }
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph) {
