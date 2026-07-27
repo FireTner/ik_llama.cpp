@@ -203,17 +203,21 @@ static __global__ void k_concat_simple(int64_t n1, int64_t n, const float * __re
     dst[i] = i < n1 ? src1[i] : src2[i - n1];
 }
 
-static __global__ void k_concat_dim0(int ne0, int ne00,
+static __global__ void k_concat_dim0(int ne0, int ne00, int ne2,
         size_t nb01, size_t nb02, size_t nb03,
         size_t nb11, size_t nb12, size_t nb13,
         size_t nb1,  size_t nb2,  size_t nb3,
         const float * __restrict__ src1, const float * __restrict__ src2, float * __restrict__ dst) {
 
-    src1 += blockIdx.x * nb01 + blockIdx.y * nb02 + blockIdx.z * nb03;
-    src2 += blockIdx.x * nb11 + blockIdx.y * nb12 + blockIdx.z * nb13;
-    dst  += blockIdx.x * nb1  + blockIdx.y * nb2  + blockIdx.z * nb3;
+    const int i1 = blockIdx.y;
+    const int i2 = blockIdx.z % ne2;
+    const int i3 = blockIdx.z / ne2;
 
-    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+    src1 += i1 * nb01 + i2 * nb02 + i3 * nb03;
+    src2 += i1 * nb11 + i2 * nb12 + i3 * nb13;
+    dst  += i1 * nb1  + i2 * nb2  + i3 * nb3;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ne0; i += gridDim.x * blockDim.x) {
         dst[i] = i < ne00 ? src1[i] : src2[i - ne00];
     }
 }
@@ -233,8 +237,11 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
+    const bool dim0_single_row = dim == 0 && dst->ne[1]*dst->ne[2]*dst->ne[3] == 1 &&
+        ggml_nbytes(dst) == ggml_nbytes(src0) + ggml_nbytes(src1);
+
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-        (dim == 3 || (dim == 2 && dst->ne[3] == 1) || (dim == 1 && dst->ne[2]*dst->ne[3] == 1))) {
+        (dim == 3 || (dim == 2 && dst->ne[3] == 1) || (dim == 1 && dst->ne[2]*dst->ne[3] == 1) || dim0_single_row)) {
         //printf("%s(%s): using cudaMemcpyAsync\n", __func__, dst->name);
         constexpr int k_block_size = 512;
         int64_t n1 = ggml_nbytes(src0);
@@ -263,8 +270,8 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (row_size_src0 % sizeof(float) == 0 && row_size_src1 % sizeof(float) == 0 && row_size_dst % sizeof(float) == 0) {
             auto ne00_eff = row_size_src0/sizeof(float);
             auto ne0_eff  = row_size_dst /sizeof(float);
-            dim3 grid(dst->ne[1], dst->ne[2], dst->ne[3]);
-            k_concat_dim0<<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream()>>>(ne0_eff, ne00_eff,
+            dim3 grid((ne0_eff + CUDA_CONCAT_BLOCK_SIZE - 1)/CUDA_CONCAT_BLOCK_SIZE, dst->ne[1], dst->ne[2]*dst->ne[3]);
+            k_concat_dim0<<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream()>>>(ne0_eff, ne00_eff, dst->ne[2],
                     src0->nb[1]/sizeof(float), src0->nb[2]/sizeof(float), src0->nb[3]/sizeof(float),
                     src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float),
                      dst->nb[1]/sizeof(float),  dst->nb[2]/sizeof(float),  dst->nb[3]/sizeof(float),
