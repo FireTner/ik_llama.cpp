@@ -82,7 +82,12 @@ struct spec_tuner {
     void write_best(common_params_speculative & params) const;
 
     bool has_dflash_target_only_arm() const {
-        return enabled && spec_type == COMMON_SPECULATIVE_TYPE_DFLASH && configured_n_max > 0;
+        // Name is historical (DFlash); DSpark shares the same multi-layer target-tap
+        // draft path and also needs n_max=0 so autotune can fall back to target-only
+        // when greedy accept is too low to beat baseline decode.
+        return enabled && configured_n_max > 0 &&
+               (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
     }
 
 private:

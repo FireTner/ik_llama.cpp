@@ -153,10 +153,11 @@ struct common_speculative_state_dspark : public common_speculative_state {
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        // Match DFlash: reset only the draft-side state. Target-tap rows are populated by
+        // prompt warmup (common_speculative_on_target_seq_batch) before begin() runs; clearing
+        // them here leaves draft() with an empty window and #gen drafts = 0 forever.
+        // Full target-feature reset belongs in clear_target_features() / clear_sequence_hidden().
         llama_kv_cache_clear(ctx_dft);
-        ctx_window.clear();
-        ctx_window_pos.clear();
-        last_target_pos = -1;
         llama_reset_dspark_ctx(ctx_dft);
     }
 

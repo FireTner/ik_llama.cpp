@@ -1609,16 +1609,21 @@ llama_tokens common_speculative_draft(
         auto & impl = spec->impls[i];
         const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
-        if (spec->tuner && spec->tuner->enabled && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (spec->tuner && spec->tuner->enabled &&
+                (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                 impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
             impl_params.n_max = params.n_max;
         }
         result.clear();
 
         if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
-                impl->type == COMMON_SPECULATIVE_TYPE_DFLASH && impl_params.n_max == 0) {
+                (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                 impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) &&
+                impl_params.n_max == 0) {
             spec->curr_impl = impl.get();
             spec->last_step_target_only = true;
-            LOG_DBG("%s: selected DFlash target-only arm\n", __func__);
+            LOG_DBG("%s: selected target-only arm for %s\n",
+                    __func__, common_speculative_type_to_str(impl->type).c_str());
             break;
         }
 
@@ -1969,6 +1974,12 @@ bool common_speculative_load_draft_model(
     params_dft.n_gpu_layers     = params.n_gpu_layers;
     params_dft.cache_type_k     = params.cache_type_k.empty() ? params_base.cache_type_k : params.cache_type_k;
     params_dft.cache_type_v     = params.cache_type_v.empty() ? params_base.cache_type_v : params.cache_type_v;
+
+    // Target -ot / tensor_buft_overrides must not apply to the drafter. Hermès parks early
+    // target blk.* on CPU via a regex that also matches draft blk.*; that fractures the draft
+    // graph (dozens of splits) and collapses decode. Draft-specific -ot can still be set via
+    // speculative.params below.
+    params_dft.tensor_buft_overrides.clear();
 
     if (!params.params.empty()) {
         auto [argc, argv] = parse_command_line("llama-server " + params.params);

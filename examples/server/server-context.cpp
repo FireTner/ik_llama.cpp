@@ -79,8 +79,12 @@ static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
 }
 
 static bool server_speculative_uses_target_features(const common_params_speculative & spec) {
+    // DSpark reuses DFlash's multi-layer target capture / feature-view path; without this
+    // gate the server never warms or commits target taps, so draft() sees an empty window
+    // and reports #gen drafts = 0.
     return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
 }
 
 static bool server_speculative_requires_single_slot(const common_params_speculative & spec) {

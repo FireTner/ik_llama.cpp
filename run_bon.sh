@@ -23,14 +23,19 @@ export CUDA_MODULE_LOADING=LAZY
 #
 # VRAM for DSpark @64k (only clean levers left):
 #   CPU_LAYERS=0-N  → -ot early blk.* to CPU, keep -ngl 99 (output stays GPU); ~51 MiB/layer
-#                     0-11 ≈ 0.6 GiB, 0-19 ≈ 1.0 GiB. Default 0-15 only when DSpark actually loads.
+#                     0-11 ≈ 0.6 GiB, 0-19 ≈ 1.0 GiB. Off by default (park tax > VRAM win here).
 #   quit Vesktop/Brave → ~300–400 MiB desktop
 #   -ngld low + -cd 4096 → draft KV tiny; unique draft weights often ~0.5 GiB if shared
 # Never UVM. Never trade away 64k for Hermès.
 #
+# Default: do NOT park layers. Target -ot park fractures the main graph (splits≈200)
+# and collapses decode even when the drafter stays on GPU. IO-share already fits DSpark
+# @64k without parking (~6.8–6.9 GiB). Use CPU_LAYERS=0-15 only if you need VRAM headroom
+# and accept the PCIe/split tax.
+#
 #   USE_DSPARK=1 ./run_bon.sh
-#   CPU_LAYERS=0-19 USE_DSPARK=1 ./run_bon.sh   # more headroom if OOM
-#   CPU_LAYERS=0 USE_DSPARK=1 ./run_bon.sh      # set 0 to disable layer park
+#   CPU_LAYERS=0-19 USE_DSPARK=1 ./run_bon.sh   # more headroom if OOM (slower)
+#   CPU_LAYERS=0-15 USE_DSPARK=1 ./run_bon.sh   # explicit park
 #
 # Download drafter (~1.8G; ~3.5G free on /home):
 #   huggingface-cli download Danny-Dasilva/Bonsai-27B-antidoom-1bit-DSpark \
@@ -64,13 +69,8 @@ if [ "$USE_DSPARK" = "1" ]; then
     fi
 fi
 
-# Default park blk.0-15 only when DSpark is actually active. Explicit CPU_LAYERS always wins;
-# CPU_LAYERS=0 disables parking.
-if [ "$DSPARK_ACTIVE" = "1" ]; then
-    CPU_LAYERS="${CPU_LAYERS:-0-15}"
-else
-    CPU_LAYERS="${CPU_LAYERS:-}"
-fi
+# No default park. Explicit CPU_LAYERS=0-N enables it; CPU_LAYERS=0 is a no-op.
+CPU_LAYERS="${CPU_LAYERS:-}"
 if [ "$CPU_LAYERS" = "0" ]; then
     CPU_LAYERS=""
 fi

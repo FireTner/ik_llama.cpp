@@ -846,7 +846,8 @@ int main(int argc, char ** argv) {
                     embd_is_prompt &&
                     spec != nullptr &&
                     (params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH));
+                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
 
                 llama_batch batch = {};
                 if (need_prompt_target_features) {
