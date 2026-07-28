@@ -1398,6 +1398,29 @@ common_speculative * common_speculative_init(
         configs.push_back(common_speculative_config(stage, stage_params));
     }
 
+    std::vector<std::unique_ptr<common_speculative_state>> impls = {};
+
+    // Create DSpark states BEFORE recurrent per-step checkpoint allocation. Markov CUDA
+    // needs ~250 MiB for fp16 heads; the qwen35 per-step buffer is ~600 MiB and would
+    // otherwise leave too little free VRAM on 8GB cards for the device resample path.
+    for (const common_speculative_config & config : configs) {
+        if (config.type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            continue;
+        }
+        LOG_DBG("%s: early-adding DSpark implementation (before recurrent ckpt alloc)\n", __func__);
+        auto state = std::make_unique<common_speculative_state_dspark>(
+            config.type,
+            ctx_tgt,
+            ctx_dft,
+            config.params.dflash_cross_ctx);
+        if (!state->ready) {
+            LOG_ERR("%s: failed to initialize DSpark speculative state\n", __func__);
+            return nullptr;
+        }
+        impls.push_back(std::move(state));
+        ctx_dft = nullptr;
+    }
+
     if (!configs.empty() && (llama_model_has_recurrent(llama_get_model(ctx_tgt)) ||
                              llama_model_is_openpangu(llama_get_model(ctx_tgt)))) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
@@ -1417,8 +1440,6 @@ common_speculative * common_speculative_init(
         llama_spec_ckpt_discard(ctx_tgt);
         params.recurrent_ckpt_mode = actual_mode;
     }
-
-    std::vector<std::unique_ptr<common_speculative_state>> impls = {};
 
     for (const common_speculative_config & config : configs) {
         LOG_DBG("%s: adding implementation %s\n", __func__, common_speculative_type_to_str(config.type).c_str());
@@ -1448,17 +1469,7 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                auto state = std::make_unique<common_speculative_state_dspark>(
-                    config.type,
-                    ctx_tgt,
-                    ctx_dft,
-                    config.params.dflash_cross_ctx);
-                if (!state->ready) {
-                    LOG_ERR("%s: failed to initialize DSpark speculative state\n", __func__);
-                    return nullptr;
-                }
-                impls.push_back(std::move(state));
-                ctx_dft = nullptr;
+                // Already constructed above (before recurrent ckpt alloc) for VRAM ordering.
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {

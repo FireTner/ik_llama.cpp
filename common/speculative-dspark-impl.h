@@ -195,9 +195,10 @@ struct common_speculative_state_dspark : public common_speculative_state {
         }
         if (want_cuda_markov) {
             size_t free_b = 0, total_b = 0;
-            const size_t need_b = (size_t) n_vocab * (size_t) markov_rank * sizeof(float) * 2
-                    + (size_t) block_size * (size_t) n_vocab * sizeof(float) // base logits scratch
-                    + (32ull << 20); // ~32 MiB slack for partials / fragmentation
+            // FP16 weights on device (~2x smaller than f32). Still need base-logit scratch.
+            const size_t need_b = (size_t) n_vocab * (size_t) markov_rank * sizeof(uint16_t) * 2
+                    + (size_t) block_size * (size_t) n_vocab * sizeof(float)
+                    + (8ull << 20); // ~8 MiB slack (fp16 weights ~243 MiB on Bonsai)
             if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < need_b) {
                 LOG_INF("%s: - device markov resample (CUDA) skipped (free=%.0f MiB need=%.0f MiB) -- host OpenMP path\n",
                         __func__, free_b / (1024.0 * 1024.0), need_b / (1024.0 * 1024.0));

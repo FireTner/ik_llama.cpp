@@ -1,14 +1,21 @@
 // Device-side dspark vanilla Markov resample. See dspark-markov.h for the
 // contract and the exact math. Self-contained: depends only on the CUDA
 // runtime, not on ggml/llama internals.
+//
+// Weights are stored as FP16 on device (~2x smaller than FP32) so the path can
+// fit on 8GB Hermès stacks after the draft per-step buffer. Math promotes to
+// FP32 in-registers; functionally equivalent to the host path (tie-breaks may
+// differ on near-ties; target verify still arbitrates committed tokens).
 
 #include "dspark-markov.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 #define DSPARK_WARP            32
 #define DSPARK_WARPS_PER_BLOCK 8
@@ -29,8 +36,8 @@ struct dspark_markov_cuda {
     int64_t n_vocab = 0;
     int64_t rank    = 0;
 
-    float * d_w1 = nullptr; // [n_vocab * rank]
-    float * d_w2 = nullptr; // [n_vocab * rank]
+    __half * d_w1 = nullptr; // [n_vocab * rank] fp16
+    __half * d_w2 = nullptr; // [n_vocab * rank] fp16
 
     // per-round scratch (grown lazily to fit n_use)
     int64_t base_cap_rows = 0;   // rows currently allocated in d_base / h_base
@@ -47,15 +54,9 @@ struct dspark_markov_cuda {
     cudaStream_t stream = nullptr;
 };
 
-// Fused GEMV + add-base + per-block partial argmax for one position k.
-// One warp reduces one vocab row's rank-length dot product (coalesced reads
-// of w2), lane 0 adds the base logit and tracks the warp's running best over
-// its grid-stride rows; the block then reduces its 8 warp bests to one
-// (value, index) partial. Ties resolve to the lowest vocab index, matching
-// the host path's strict-greater argmax.
 __global__ void dspark_gemv_argmax_partial(
-        const float * __restrict__ w1,
-        const float * __restrict__ w2,
+        const __half * __restrict__ w1,
+        const __half * __restrict__ w2,
         const float * __restrict__ base,
         const int32_t * __restrict__ prev,
         int64_t n_vocab,
@@ -71,7 +72,7 @@ __global__ void dspark_gemv_argmax_partial(
 
     const int64_t w1_off = (int64_t) prev[0] * (int64_t) rank;
     for (int r = tid; r < rank; r += DSPARK_BLK_THREADS) {
-        w1s[r] = w1[w1_off + r];
+        w1s[r] = __half2float(w1[w1_off + r]);
     }
     __syncthreads();
 
@@ -83,24 +84,17 @@ __global__ void dspark_gemv_argmax_partial(
     const int64_t gw     = (int64_t) blockIdx.x * DSPARK_WARPS_PER_BLOCK + wid;
     const int64_t stride = (int64_t) gridDim.x  * DSPARK_WARPS_PER_BLOCK;
     for (int64_t v = gw; v < n_vocab; v += stride) {
-        const float * w2row = w2 + v * (int64_t) rank;
+        const __half * w2row = w2 + v * (int64_t) rank;
         float acc = 0.0f;
         for (int r = lane; r < rank; r += DSPARK_WARP) {
-            acc += w1s[r] * w2row[r];
+            acc += w1s[r] * __half2float(w2row[r]);
         }
-        // warp tree-reduction: its floating-point accumulation order differs from
-        // the host scalar loop (and from BLAS), so the correction -- and thus a
-        // near-tie argmax -- is functionally equivalent, not bit-identical, to the
-        // host paths. This only changes which speculative draft is proposed; the
-        // target verify arbitrates the committed output. See dspark-markov.h.
         #pragma unroll
         for (int o = DSPARK_WARP / 2; o > 0; o >>= 1) {
             acc += __shfl_xor_sync(0xffffffffu, acc, o);
         }
         if (lane == 0) {
             const float logit = base[base_off + v] + acc;
-            // strict >: rows are visited in increasing v, so the lowest index
-            // wins ties (same as the host scalar/BLAS argmax).
             if (logit > bestv) {
                 bestv = logit;
                 besti = (int32_t) v;
@@ -108,7 +102,7 @@ __global__ void dspark_gemv_argmax_partial(
         }
     }
 
-    __shared__ float   sv[DSPARK_WARPS_PER_BLOCK];
+    __shared__ float sv[DSPARK_WARPS_PER_BLOCK];
     __shared__ int32_t si[DSPARK_WARPS_PER_BLOCK];
     if (lane == 0) {
         sv[wid] = bestv;
@@ -117,7 +111,7 @@ __global__ void dspark_gemv_argmax_partial(
     __syncthreads();
 
     if (tid == 0) {
-        float   bv = sv[0];
+        float bv = sv[0];
         int32_t bi = si[0];
         #pragma unroll
         for (int w = 1; w < DSPARK_WARPS_PER_BLOCK; ++w) {
@@ -131,22 +125,19 @@ __global__ void dspark_gemv_argmax_partial(
     }
 }
 
-// Reduce the per-block partials to the single global argmax, write it to
-// out[k] and forward it into prev for the next position (the device-side
-// chaining step). Single block.
 __global__ void dspark_argmax_final(
-        const float   * __restrict__ part_val,
+        const float * __restrict__ part_val,
         const int32_t * __restrict__ part_idx,
-        int       nparts,
-        int64_t   k,
+        int nparts,
+        int64_t k,
         int32_t * __restrict__ out,
         int32_t * __restrict__ prev) {
-    __shared__ float   sv[DSPARK_BLK_THREADS];
+    __shared__ float sv[DSPARK_BLK_THREADS];
     __shared__ int32_t si[DSPARK_BLK_THREADS];
 
     const int tid = threadIdx.x;
 
-    float   bv = -CUDART_INF_F;
+    float bv = -CUDART_INF_F;
     int32_t bi = 0;
     for (int i = tid; i < nparts; i += DSPARK_BLK_THREADS) {
         if (part_val[i] > bv || (part_val[i] == bv && part_idx[i] < bi)) {
@@ -169,7 +160,7 @@ __global__ void dspark_argmax_final(
     }
 
     if (tid == 0) {
-        out[k]  = si[0];
+        out[k] = si[0];
         prev[0] = si[0];
     }
 }
@@ -211,7 +202,8 @@ dspark_markov_cuda * dspark_markov_cuda_init(
     ctx->n_vocab = n_vocab;
     ctx->rank    = markov_rank;
 
-    const size_t nbytes = (size_t) n_vocab * (size_t) markov_rank * sizeof(float);
+    const size_t n_elem = (size_t) n_vocab * (size_t) markov_rank;
+    const size_t nbytes = n_elem * sizeof(__half);
 
     bool ok = true;
     auto guard = [&](cudaError_t e, const char * what) {
@@ -228,14 +220,24 @@ dspark_markov_cuda * dspark_markov_cuda_init(
     guard(cudaMalloc(&ctx->d_part_val, DSPARK_NBLOCKS * sizeof(float)), "cudaMalloc part_val");
     guard(cudaMalloc(&ctx->d_part_idx, DSPARK_NBLOCKS * sizeof(int32_t)), "cudaMalloc part_idx");
     if (ok) {
-        guard(cudaMemcpy(ctx->d_w1, w1, nbytes, cudaMemcpyHostToDevice), "H2D w1");
-        guard(cudaMemcpy(ctx->d_w2, w2, nbytes, cudaMemcpyHostToDevice), "H2D w2");
+        // Host-side f32→f16 staging (one-shot at init).
+        std::vector<__half> tmp(n_elem);
+        for (size_t i = 0; i < n_elem; ++i) {
+            tmp[i] = __float2half(w1[i]);
+        }
+        guard(cudaMemcpy(ctx->d_w1, tmp.data(), nbytes, cudaMemcpyHostToDevice), "H2D w1");
+        for (size_t i = 0; i < n_elem; ++i) {
+            tmp[i] = __float2half(w2[i]);
+        }
+        guard(cudaMemcpy(ctx->d_w2, tmp.data(), nbytes, cudaMemcpyHostToDevice), "H2D w2");
     }
 
     if (!ok) {
         dspark_markov_cuda_free(ctx);
         return nullptr;
     }
+    fprintf(stderr, "dspark-markov: CUDA fp16 weights ready (%.1f MiB)\n",
+            (2.0 * nbytes) / (1024.0 * 1024.0));
     return ctx;
 }
 
@@ -272,13 +274,11 @@ bool dspark_markov_cuda_resample(
     const int64_t V = ctx->n_vocab;
     const int     R = (int) ctx->rank;
 
-    // Stage this round's base logits into pinned host memory, then one H2D.
     const size_t base_elems = (size_t) n_use * (size_t) V;
     memcpy(ctx->h_base, base_logits, base_elems * sizeof(float));
     DSPARK_CUDA_CHECK(cudaMemcpyAsync(ctx->d_base, ctx->h_base, base_elems * sizeof(float),
                                       cudaMemcpyHostToDevice, ctx->stream));
 
-    // Seed the chained prev with the anchor token (prev for k == 0).
     DSPARK_CUDA_CHECK(cudaMemcpyAsync(ctx->d_prev, &id_last, sizeof(int32_t),
                                       cudaMemcpyHostToDevice, ctx->stream));
 
