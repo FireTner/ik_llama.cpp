@@ -1,7 +1,28 @@
 # Bonsai-27B on ik_llama.cpp — Findings
 
+> ## Epistemic banner (2026-07-28) — read before using numbers
+>
+> This file documents the **`Bonsai-27B-antidoom-1bit-Q1_0`** journey (2026-07-22 era).
+> It is **not** interchangeable with the current default in `run_bon.sh`:
+>
+> | | This file (historical) | Current Hermès default (`run_bon.sh`) |
+> |---|---|---|
+> | GGUF | `Bonsai-27B-antidoom-1bit-Q1_0.gguf` (~4.4 GB disk) | `prism-ml/.../Bonsai-27B-Q1_0.gguf` |
+> | CUDA0 weights (typical) | **~4270 MiB** | **~3446 MiB** |
+> | Short / @~20k tg (post Q1 CUDA) | **~35 / ~24 t/s** | **~40 / ~26.5 t/s** (re-measured 2026-07-28) |
+> | Full offload smi @64k | **~5900–5960 MiB** | **~5.1–5.3 GiB** process (non-DSpark) |
+>
+> **Still trustworthy from this file (mechanism / cliffs):** UVM paging disaster; missing CUDA Q1 → huge splits; never `-ngl ≤ 64` (compute wash ~1247 MiB); prefer hard OOM over UVM; q4 KV + Hadamard as working KV class.
+>
+> **Do not treat as current baseline without re-measure:** absolute VRAM headroom, “~1 GB free for DSpark”, tg ceilings, checkpoint create **~200 ms/512 tok** (not re-timed on Prism).
+>
+> **Current stack + trust tiers (local, gitignored):** `.local/findings/00-trust-and-stack.md`  
+> **Current Hermès / DSpark benches:** `.local/findings/bonsai-64k-bench.md`
+>
+> Keep this file as archaeology. Prefer appending corrections to `.local/findings/` over silently rewriting history here.
+
 Notes from tuning `Bonsai-27B-antidoom-1bit-Q1_0` for Hermès on this machine (2026-07-22).
-Launch script: `run_bon.sh`. Build: `build_native.sh` (Zen4 + CUDA sm_89).
+Launch script: `run_bon.sh` (defaults have since moved to the Prism GGUF — see banner). Build: `build_native.sh` (Zen4 + CUDA sm_89).
 
 ---
 

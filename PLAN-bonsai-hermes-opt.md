@@ -1,13 +1,28 @@
 <!-- /autoplan restore point: /home/cachyfire/.gstack/projects/ikawrakow-ik_llama.cpp/main-autoplan-restore-20260723-004118.md -->
-Status: APPROVED
+Status: APPROVED (plan text below is historical; numeric baselines need the 2026-07-28 reconciliation)
 
 # Plan: Bonsai-27B Hermès — exhaust optimizations, ship Top 10
+
+> ## Baseline reconciliation (2026-07-28) — not part of the original autoplan
+>
+> Original plan numbers were taken from **`FINDINGS.md` (antidoom GGUF)**. Current `run_bon.sh` defaults use **Prism** `Bonsai-27B-Q1_0.gguf`. Do not mix them.
+>
+> | Metric | Plan / FINDINGS (antidoom-era) | Current Prism T1 (`.local/findings/`) |
+> |---|---|---|
+> | Short tg | ~35 t/s | **~40.3 t/s** |
+> | @~20k tg | ~24 t/s | **~26.5 t/s** |
+> | Non-DSpark VRAM | ~5960 MiB class | **~5.1–5.3 GiB** process; weights **~3446 MiB** |
+> | DSpark @64k | “not fully measured” | Measured: fits; drafts after fix; **no tg win** vs target-only; autotune → n_max=0 |
+> | C0 “IO-share unlocks DSpark speedup” | Assumed large upside | IO-share **works**; speedup **not observed** on 8GB Hermès |
+>
+> Trust / stack identity: `.local/findings/00-trust-and-stack.md`. Full chronology: `.local/findings/bonsai-64k-bench.md`.  
+> Success metrics below (≥30 t/s @20k with DSpark) remain **aspirational**; M5 on this laptop did not hit them.
 
 **Branch:** main  
 **Machine:** Ryzen 9 7845HX + RTX 4060 Laptop 8GB + ~14GB RAM  
 **Goal:** Hermès at `-c 65536`, maximize long-ctx tokens/s and multi-turn wall-clock  
-**Baseline (FINDINGS.md):** short ~35 t/s; ~20k ctx ~24 t/s; full offload ~5960 MiB; DSpark path not fully measured yet  
-**Shipped code:** DSpark IO-tensor sharing + sync KV serialize + async host-commit checkpoint worker (unsafe async D2H dropped)
+**Baseline (original plan text, antidoom FINDINGS.md):** short ~35 t/s; ~20k ctx ~24 t/s; full offload ~5960 MiB; DSpark path not fully measured yet — **see banner for Prism updates**  
+**Shipped code (has continued past this plan):** DSpark IO-tensor sharing; draft-path / park fixes; markov+confidence (+ CUDA fp16 markov); sync KV serialize + async host-commit checkpoint worker (unsafe async D2H dropped)
 
 ## Problem statement
 

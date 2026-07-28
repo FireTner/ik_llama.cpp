@@ -18,26 +18,30 @@ fi
 export CUDA_MODULE_LOADING=LAZY
 
 # --- Hermès needs -c 65536. Do not shrink CTX. ---
-# Full @64k: w4270 + KV1301 + c252 ≈ 5.8 GiB → ~5960 in nvidia-smi; ~1GB free w/ desktop.
+# Current default GGUF: prism-ml Bonsai-27B-Q1_0 (~3446 MiB CUDA weights measured 2026-07-28).
+# Older antidoom pack was ~4270 MiB weights / ~5960 MiB full offload — do not mix those numbers
+# into Prism VRAM math. See .local/findings/00-trust-and-stack.md (gitignored) and FINDINGS.md banner.
 # NEVER -ngl ≤64: parks output on CPU, compute 252→1247 (VRAM wash + slower tg).
 #
 # VRAM for DSpark @64k (only clean levers left):
-#   CPU_LAYERS=0-N  → -ot early blk.* to CPU, keep -ngl 99 (output stays GPU); ~51 MiB/layer
-#                     0-11 ≈ 0.6 GiB, 0-19 ≈ 1.0 GiB. Off by default (park tax > VRAM win here).
-#   quit Vesktop/Brave → ~300–400 MiB desktop
-#   -ngld low + -cd 4096 → draft KV tiny; unique draft weights often ~0.5 GiB if shared
+#   CPU_LAYERS=0-N  → -ot early blk.* to CPU, keep -ngl 99 (output stays GPU).
+#                     Off by default: park taxes target graph (splits≈200) and collapses tg
+#                     even when the drafter stays on GPU. Measured regression on this laptop.
+#   quit Vesktop/Brave → desktop VRAM (often ~80–150+ MiB; was higher with more Electron)
+#   -ngld low + -cd 4096 → draft KV tiny; IO-share aliases embd/lm_head with target
 # Never UVM. Never trade away 64k for Hermès.
 #
 # Default: do NOT park layers. Target -ot park fractures the main graph (splits≈200)
 # and collapses decode even when the drafter stays on GPU. IO-share already fits DSpark
-# @64k without parking (~6.8–6.9 GiB). Use CPU_LAYERS=0-15 only if you need VRAM headroom
-# and accept the PCIe/split tax.
+# @64k without parking (~6.8–7.0 GiB class). USE_DSPARK=1 + autotune currently stays
+# target-only (n_max=0) on this 8GB stack — drafting works but loses tg (see local findings).
+# Use CPU_LAYERS=0-15 only if you need VRAM headroom and accept the PCIe/split tax.
 #
 #   USE_DSPARK=1 ./run_bon.sh
 #   CPU_LAYERS=0-19 USE_DSPARK=1 ./run_bon.sh   # more headroom if OOM (slower)
 #   CPU_LAYERS=0-15 USE_DSPARK=1 ./run_bon.sh   # explicit park
 #
-# Download drafter (~1.8G; ~3.5G free on /home):
+# Drafter lives next to the Prism target by default. Historical antidoom HF id (if needed):
 #   huggingface-cli download Danny-Dasilva/Bonsai-27B-antidoom-1bit-DSpark \
 #     Bonsai-27B-dspark-Q4_1.gguf --local-dir "$MODEL_DIR"
 USE_DSPARK="${USE_DSPARK:-0}"
