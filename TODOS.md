@@ -1,7 +1,7 @@
 # TODOS (deferred)
 
 - [ ] Time host-commit checkpoint path on hybrid qwen35 (serialize stays sync; only list finalize is async)
-- [ ] Wire DSpark markov/confidence heads
+- [x] Wire DSpark markov/confidence heads
 - [ ] sm_89 Q1 MMVQ polish
 - [ ] Auto-VRAM pilot
 - [ ] Promote FINDINGS playbook into docs/

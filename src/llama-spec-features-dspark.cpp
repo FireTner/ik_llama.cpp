@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -197,6 +198,107 @@ bool llama_model_dspark_has_markov_head(const struct llama_model * model) {
            model->hparams.dspark_markov_rank > 0 &&
            model->dspark_markov_head_a != nullptr &&
            model->dspark_markov_head_b != nullptr;
+}
+
+// Dequantize / copy a model weight tensor into a dense f32 host buffer. Mirrors Prism's
+// llama_model_dspark_get_markov helper (supports f32/f16/bf16 + quantized types with to_float).
+static bool llama_dspark_tensor_to_f32(const ggml_tensor * t, std::vector<float> & out) {
+    if (t == nullptr) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    out.resize((size_t) n);
+
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            ggml_backend_tensor_get(t, out.data(), 0, (size_t) n * sizeof(float));
+            return true;
+        case GGML_TYPE_F16: {
+            std::vector<ggml_fp16_t> tmp((size_t) n);
+            ggml_backend_tensor_get(t, tmp.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
+            ggml_fp16_to_fp32_row(tmp.data(), out.data(), n);
+            return true;
+        }
+        case GGML_TYPE_BF16: {
+            std::vector<ggml_bf16_t> tmp((size_t) n);
+            ggml_backend_tensor_get(t, tmp.data(), 0, (size_t) n * sizeof(ggml_bf16_t));
+            ggml_bf16_to_fp32_row(tmp.data(), out.data(), n);
+            return true;
+        }
+        default: {
+            if (!ggml_is_quantized(t->type)) {
+                LLAMA_LOG_ERROR("%s: unsupported dspark aux-head tensor type %s\n",
+                        __func__, ggml_type_name(t->type));
+                return false;
+            }
+            const ggml_type_traits_t qtype = ggml_internal_get_type_traits(t->type);
+            if (qtype.to_float == nullptr) {
+                LLAMA_LOG_ERROR("%s: quantized type %s has no dequantizer\n",
+                        __func__, ggml_type_name(t->type));
+                return false;
+            }
+            std::vector<uint8_t> raw(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+            qtype.to_float(raw.data(), out.data(), n);
+            return true;
+        }
+    }
+}
+
+bool llama_model_dspark_get_markov(
+        const struct llama_model * model,
+        std::vector<float> & w1,
+        std::vector<float> & w2) {
+    if (!llama_model_dspark_has_markov_head(model)) {
+        return false;
+    }
+
+    const ggml_tensor * a = model->dspark_markov_head_a;
+    const ggml_tensor * b = model->dspark_markov_head_b;
+    if (a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1]) {
+        LLAMA_LOG_ERROR("%s: markov_head_a/b shape mismatch ([%lld,%lld] vs [%lld,%lld])\n",
+                __func__,
+                (long long) a->ne[0], (long long) a->ne[1],
+                (long long) b->ne[0], (long long) b->ne[1]);
+        return false;
+    }
+
+    return llama_dspark_tensor_to_f32(a, w1) && llama_dspark_tensor_to_f32(b, w2);
+}
+
+bool llama_model_dspark_get_confidence(
+        const struct llama_model * model,
+        std::vector<float> & weight,
+        float & bias,
+        int64_t & conf_in) {
+    bias = 0.0f;
+    conf_in = 0;
+    if (!llama_model_dspark_has_confidence_head(model)) {
+        return false;
+    }
+
+    const ggml_tensor * w = model->dspark_confidence_head;
+    conf_in = w->ne[0];
+    if (w->ne[1] != 1 || conf_in <= 0) {
+        LLAMA_LOG_ERROR("%s: unexpected confidence_head shape [%lld, %lld]\n",
+                __func__, (long long) w->ne[0], (long long) w->ne[1]);
+        return false;
+    }
+
+    if (!llama_dspark_tensor_to_f32(w, weight)) {
+        return false;
+    }
+
+    if (model->dspark_confidence_head_b != nullptr) {
+        std::vector<float> b;
+        if (!llama_dspark_tensor_to_f32(model->dspark_confidence_head_b, b) || b.empty()) {
+            return false;
+        }
+        bias = b[0];
+    }
+
+    return true;
 }
 
 bool llama_model_dspark_log_snr_conditioning(const struct llama_model * model) {

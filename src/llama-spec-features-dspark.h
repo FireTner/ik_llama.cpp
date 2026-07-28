@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 struct llama_model;
 
@@ -59,6 +60,22 @@ bool llama_model_dspark_confidence_head_with_markov(const struct llama_model * m
 
 // True only if markov_rank > 0 AND both markov_head_a/b tensors actually loaded.
 bool llama_model_dspark_has_markov_head(const struct llama_model * model);
+
+// Host-side copies of the low-rank Markov factors as dense f32, layout matching Prism
+// (common/dspark-markov.h): [n_vocab * markov_rank] row-major, rank fastest-varying.
+// Returns false if the head is missing or a tensor type cannot be dequantized.
+bool llama_model_dspark_get_markov(
+        const struct llama_model * model,
+        std::vector<float> & w1,
+        std::vector<float> & w2);
+
+// Host-side copy of confidence_head weight [conf_in] and optional bias scalar.
+// conf_in = n_embd (+ markov_rank when confidence_head_with_markov). Returns false if absent.
+bool llama_model_dspark_get_confidence(
+        const struct llama_model * model,
+        std::vector<float> & weight,
+        float & bias,
+        int64_t & conf_in);
 
 bool llama_model_dspark_log_snr_conditioning(const struct llama_model * model);
 float llama_model_dspark_min_log_snr(const struct llama_model * model);

@@ -121,6 +121,16 @@ llama_option_depr(WARNING     LLAMA_SYCL                GGML_SYCL)
 llama_option_depr(WARNING     LLAMA_SYCL_F16            GGML_SYCL_F16)
 llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
 
+# DSpark host-side Markov resample acceleration (common/dspark-markov.cu). Default ON when
+# GGML_CUDA is enabled; disable with -DLLAMA_DSPARK_MARKOV_CUDA=OFF. Runtime override:
+# LLAMA_DSPARK_MARKOV_CUDA=0 falls back to the scalar host path.
+if (GGML_CUDA)
+    set(LLAMA_DSPARK_MARKOV_CUDA_DEFAULT ON)
+else()
+    set(LLAMA_DSPARK_MARKOV_CUDA_DEFAULT OFF)
+endif()
+option(LLAMA_DSPARK_MARKOV_CUDA "llama-common: CUDA Markov resample for draft-dspark" ${LLAMA_DSPARK_MARKOV_CUDA_DEFAULT})
+
 if (NOT MSVC)
     if (LLAMA_SANITIZE_THREAD)
         message(STATUS "Using -fsanitize=thread")

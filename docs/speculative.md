@@ -27,8 +27,9 @@ model's layers (concatenated multi-layer hidden states, reusing the same capture
 of causal cross-attention it denoises a whole `block_size`-token block at once with fully
 non-causal attention over `[target-tap context | draft block]`. Requires `-md/--model-draft`
 pointed at a DSpark GGUF. The initial port samples draft tokens greedily from the base trunk
-logits; the model's markov-head resampling and confidence-head gating are loaded but not yet
-applied.
+logits; the model's markov-head resampling and confidence-head gating are applied
+host-side (Prism-compatible sequential markov argmax chain; confidence truncates the
+draft when prefix survival ∏c_i drops below `p_min`).
 
 ```
 llama-server [...] --model-draft dspark.gguf --spec-type draft-dspark:n_max=4,cross_ctx=512

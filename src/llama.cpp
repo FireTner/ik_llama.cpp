@@ -5663,6 +5663,12 @@ static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
         lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT);
 }
 
+// DSpark's host-side confidence head needs result_norm embeddings alongside lm_head logits
+// (markov resample is logits-only; confidence = sigmoid(W · concat(h, markov_emb[prev]))).
+static bool llama_context_has_dual_outputs(const llama_context & lctx) {
+    return llama_context_has_mtp_outputs(lctx) || lctx.model.arch == LLM_ARCH_DSPARK;
+}
+
 static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     const auto & cparams = lctx.cparams;
     const auto & hparams = lctx.model.hparams;
@@ -5674,9 +5680,9 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     const auto n_embd  = llama_output_embd_width(lctx);
 
     // TODO: use a per-batch flag for logits presence instead
-    const bool has_mtp = llama_context_has_mtp_outputs(lctx);
-    const bool has_logits = !cparams.embeddings || has_mtp;
-    const bool has_embd   = lctx.is_encoding || (cparams.embeddings && (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) || has_mtp;
+    const bool has_dual = llama_context_has_dual_outputs(lctx);
+    const bool has_logits = !cparams.embeddings || has_dual;
+    const bool has_embd   = lctx.is_encoding || (cparams.embeddings && (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) || has_dual;
 
     const size_t logits_size = has_logits ? n_vocab*n_outputs_max : 0;
     const size_t embd_size   = has_embd   ?  n_embd*n_outputs_max : 0;
@@ -5729,8 +5735,8 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
         // The output buffer will get populated with meaningful results in llama_decode
         // If it doesn't, the solution is not to just blindly zero the buffer
         // but to fix the bug that causes meaningless results.
-        if (has_mtp) {
-            // MTP uses a large output footprint, clear only the active region.
+        if (has_dual) {
+            // MTP/DSpark use a large output footprint, clear only the active region.
             const size_t clear_size = (logits_size + embd_size) * sizeof(float);
             if (clear_size > 0 && output_base) {
                 memset(output_base, 0, clear_size);
@@ -6212,10 +6218,11 @@ static int llama_decode_internal(
         }
         else {
             const bool has_mtp = llama_context_has_mtp_outputs(lctx);
+            const bool has_dual = llama_context_has_dual_outputs(lctx);
             const bool use_raw_mtp_embd = has_mtp && (lctx.model.arch == LLM_ARCH_GEMMA4    ||
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_MTP||
                                                       lctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT);
-            if (cparams.embeddings || has_mtp) {
+            if (cparams.embeddings || has_dual) {
                 for (int i = gf->n_nodes - 1; i >= 0; --i) {
                     if (use_raw_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
                         // MTP recurrent state can be wider/different than the logits head hidden state.
@@ -6235,7 +6242,7 @@ static int llama_decode_internal(
                     }
                 }
             }
-            if (cparams.embeddings && lctx.model.hparams.nextn_predict_layers == 0 && !has_mtp) {
+            if (cparams.embeddings && lctx.model.hparams.nextn_predict_layers == 0 && !has_dual) {
                 res = nullptr; // do not extract logits for embedding case
             } else {
                 if (!embd) { // do not extract embeddings when not needed
