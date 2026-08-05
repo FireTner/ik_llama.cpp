@@ -678,6 +678,46 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_NUH:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
+                ml.get_key(LLM_KV_NUH_KDA_RANK,      hparams.nuh_kda_rank);
+                ml.get_key(LLM_KV_NUH_MLA_RANK,      hparams.nuh_mla_rank);
+                ml.get_key(LLM_KV_NUH_CONV_KERNEL,   hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_NUH_MLA_EVERY,     hparams.nuh_mla_every, false);
+                ml.get_key(LLM_KV_NUH_SURPRISE_GATE, hparams.nuh_surprise_gate, false);
+
+                uint32_t ffn_hidden = 0;
+                if (ml.get_key(LLM_KV_NUH_FFN_HIDDEN, ffn_hidden, false) && ffn_hidden > 0) {
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.n_ff_arr[i] = ffn_hidden;
+                    }
+                }
+
+                uint32_t head_dim = 0;
+                if (ml.get_key(LLM_KV_NUH_HEAD_DIM, head_dim, false) && head_dim > 0) {
+                    hparams.n_embd_head_k_full = head_dim;
+                    hparams.n_embd_head_v_full = head_dim;
+                }
+
+                // Conv runs on full d_model; KDA rank is separate (packed into s_l).
+                hparams.ssm_d_inner = hparams.n_embd;
+                hparams.ssm_d_state = hparams.nuh_kda_rank;
+                hparams.n_rot = 0;
+
+                if (hparams.nuh_mla_every == 0) {
+                    hparams.nuh_mla_every = 4;
+                }
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    // recurrent (KDA) unless MLA layer
+                    hparams.recurrent_layer_arr[i] = ((i + 1) % hparams.nuh_mla_every != 0);
+                }
+
+                switch (hparams.n_layer) {
+                    case 12: model.type = e_model::MODEL_1B; break; // ~88M; closest bucket
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_QWEN35MOE:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);

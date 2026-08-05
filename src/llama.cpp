@@ -3720,15 +3720,15 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         auto t = ml.get_weight(i)->tensor;
         std::string name(t->name);
         auto size = ggml_nbytes(t);
-        if (name == "token_embd.weight") {
+        if (name == "token_embd.weight" || name == "embed.weight") {
             embd_size = size;
             continue;
         }
-        if (name == "output.weight") {
+        if (name == "output.weight" || name == "lm_head.weight") {
             ow_size += size;
             continue;
         }
-        if (name == "output_norm.weight") {
+        if (name == "output_norm.weight" || name == "norm.weight") {
             continue;
         }
         if (name.find("output_hc_") == 0 || name.find("hc_head_") == 0) {
@@ -3767,10 +3767,16 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         }
         auto pos = name.find("blk.");
         if (pos != 0) {
-            LLAMA_LOG_WARN("Oops: tensor with strange name %s\n", name.c_str());
-            continue;
+            // Nuh GGUF keeps PyTorch keys: blocks.{il}.*
+            pos = name.find("blocks.");
+            if (pos != 0) {
+                LLAMA_LOG_WARN("Oops: tensor with strange name %s\n", name.c_str());
+                continue;
+            }
+            pos += 7; // strlen("blocks.")
+        } else {
+            pos += 4; // strlen("blk.")
         }
-        pos += 4;
         auto pos1 = name.find('.', pos);
         if (pos1 == std::string::npos) {
             LLAMA_LOG_WARN("Oops: tensor with strange name %s\n", name.c_str());
@@ -8467,6 +8473,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_REFACT:
         case LLM_ARCH_BLOOM:
         case LLM_ARCH_MAMBA:
+        case LLM_ARCH_NUH:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:

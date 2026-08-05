@@ -89,6 +89,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA4_ASSISTANT,"gemma4-assistant"   },
     { LLM_ARCH_OPENPANGU,       "openpangu"    },
     { LLM_ARCH_DSPARK,          "dspark"       },
+    { LLM_ARCH_NUH,             "nuh"          },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -293,6 +294,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_OPENPANGU_MHC_NUM_STREAM,      "%s.mhc_num_stream"     },
     { LLM_KV_OPENPANGU_MHC_RECUR_NORM,      "%s.mhc_recur_norm"     },
     { LLM_KV_OPENPANGU_PARAM_SINK_NUMBER,   "%s.param_sink_number"  },
+
+    { LLM_KV_NUH_KDA_RANK,                  "%s.kda_rank"           },
+    { LLM_KV_NUH_MLA_RANK,                  "%s.mla_rank"           },
+    { LLM_KV_NUH_CONV_KERNEL,               "%s.conv_kernel"        },
+    { LLM_KV_NUH_MLA_EVERY,                 "%s.mla_every"          },
+    { LLM_KV_NUH_SURPRISE_GATE,             "%s.surprise_gate"      },
+    { LLM_KV_NUH_FFN_HIDDEN,                "%s.ffn_hidden"         },
+    { LLM_KV_NUH_TIE_EMBEDDINGS,            "%s.tie_embeddings"     },
+    { LLM_KV_NUH_HEAD_DIM,                  "%s.head_dim"           },
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
@@ -324,6 +334,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_QWEN3NEXT:
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:
+    case LLM_ARCH_NUH:
         return true;
     default:
         return false;

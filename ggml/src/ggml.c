@@ -4316,6 +4316,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
+    "KDA_SCAN",
     "WIN_PART",
     "WIN_UNPART",
     "GET_REL_POS",
@@ -4361,7 +4362,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DS4_COMP",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4445,6 +4446,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
+    "kda_scan(x)",
     "win_part(x)",
     "win_unpart(x)",
     "get_rel_pos(x)",
@@ -4491,7 +4493,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -11028,6 +11030,50 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[4] = B;
     result->src[5] = C;
     result->src[6] = sq;
+
+    return result;
+}
+
+// ggml_kda_scan — elementwise s_t = decay_t * s_{t-1} + write_t (Nuh KDA)
+
+struct ggml_tensor * ggml_kda_scan(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * decay,
+        struct ggml_tensor  * write,
+        struct ggml_tensor  * sq) {
+    GGML_ASSERT(ggml_is_matrix(s));
+    GGML_ASSERT(ggml_is_matrix(decay));
+    GGML_ASSERT(ggml_is_matrix(write));
+    GGML_ASSERT(ggml_is_matrix(sq));
+    GGML_ASSERT(s->type == GGML_TYPE_F32);
+    GGML_ASSERT(decay->type == GGML_TYPE_F32);
+    GGML_ASSERT(write->type == GGML_TYPE_F32);
+    GGML_ASSERT(sq->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(decay, write));
+
+    const int64_t R        = s->ne[0];
+    const int64_t n_kv     = s->ne[1];
+    const int64_t n_tokens = decay->ne[1];
+
+    GGML_ASSERT(decay->ne[0] == R);
+    GGML_ASSERT(sq->ne[0] == n_kv);
+    GGML_ASSERT(sq->ne[1] == n_tokens);
+
+    bool is_node = false;
+    if (s->grad || decay->grad || write->grad || sq->grad) {
+        GGML_ABORT("fatal error"); // TODO: implement
+        is_node = true;
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, R * n_tokens + R * n_kv);
+
+    result->op   = GGML_OP_KDA_SCAN;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = s;
+    result->src[1] = decay;
+    result->src[2] = write;
+    result->src[3] = sq;
 
     return result;
 }
@@ -23791,6 +23837,87 @@ static void ggml_compute_forward_ssm_scan(
     }
 }
 
+// ggml_compute_forward_kda_scan
+
+static void ggml_compute_forward_kda_scan_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // s:     [R, n_kv]
+    const struct ggml_tensor * src1 = dst->src[1]; // decay: [R, n_tokens]
+    const struct ggml_tensor * src2 = dst->src[2]; // write: [R, n_tokens]
+    const struct ggml_tensor * src3 = dst->src[3]; // sq:    [n_kv, n_tokens]
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t R        = src0->ne[0];
+    const int64_t n_kv     = src0->ne[1];
+    const int64_t n_tokens = src1->ne[1];
+
+    GGML_ASSERT((int64_t) R * n_tokens + (int64_t) R * n_kv == ggml_nelements(dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[1] == (size_t) R * sizeof(float));
+
+    float * dst_states = (float *) dst->data;
+    float * dst_s      = dst_states + R * n_tokens;
+
+    // Parallelize over rank elements
+    const int64_t dr = (R + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, R);
+
+    // Seed destination state from prior state for all seqs (thread-local rows).
+    for (int64_t kv = 0; kv < n_kv; ++kv) {
+        const float * s0 = (const float *) ((const char *) src0->data + kv * src0->nb[1]);
+        float * s_dst = dst_s + kv * R;
+        for (int64_t r = ir0; r < ir1; ++r) {
+            s_dst[r] = s0[r];
+        }
+    }
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int32_t * sq = (const int32_t *) ((const char *) src3->data + t * src3->nb[1]);
+        const int32_t seq0 = sq[0];
+        GGML_ASSERT(0 <= seq0 && seq0 < n_kv);
+
+        const float * decay = (const float *) ((const char *) src1->data + t * src1->nb[1]);
+        const float * write = (const float *) ((const char *) src2->data + t * src2->nb[1]);
+        float * s_seq = dst_s + seq0 * R;
+        float * out_t = dst_states + t * R;
+
+        for (int64_t r = ir0; r < ir1; ++r) {
+            const float st = decay[r] * s_seq[r] + write[r];
+            s_seq[r] = st;
+            out_t[r] = st;
+        }
+
+        // Mirror state to other seq ids in the map (ssm_conv convention)
+        for (int64_t k = 1; k < n_kv; ++k) {
+            const int32_t seq = sq[k];
+            if (0 <= seq && seq < n_kv && seq != seq0) {
+                float * s_other = dst_s + seq * R;
+                for (int64_t r = ir0; r < ir1; ++r) {
+                    s_other[r] = s_seq[r];
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_kda_scan(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_kda_scan_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_solve_tri
 
 static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
@@ -26615,6 +26742,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_KDA_SCAN:
+            {
+                ggml_compute_forward_kda_scan(params, tensor);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 ggml_compute_forward_solve_tri(params, tensor);
@@ -27800,6 +27931,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             }
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_KDA_SCAN:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -28555,6 +28687,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_KDA_SCAN:
             {
                 n_tasks = n_threads;
             } break;

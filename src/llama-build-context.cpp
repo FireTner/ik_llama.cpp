@@ -2705,6 +2705,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_qwen3next();
             } break;
+        case LLM_ARCH_NUH:
+            {
+                result = llm.build_nuh();
+            } break;
         case LLM_ARCH_QWEN35MOE:
             {
                 result = llm.build_qwen35moe();

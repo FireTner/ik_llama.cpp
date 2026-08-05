@@ -87,6 +87,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_OPENPANGU,
     LLM_ARCH_DSPARK,
+    LLM_ARCH_NUH,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -276,6 +277,16 @@ enum llm_kv {
     LLM_KV_OPENPANGU_MHC_NUM_STREAM,
     LLM_KV_OPENPANGU_MHC_RECUR_NORM,
     LLM_KV_OPENPANGU_PARAM_SINK_NUMBER,
+
+    // Nuh hybrid (KDA + MLA)
+    LLM_KV_NUH_KDA_RANK,
+    LLM_KV_NUH_MLA_RANK,
+    LLM_KV_NUH_CONV_KERNEL,
+    LLM_KV_NUH_MLA_EVERY,
+    LLM_KV_NUH_SURPRISE_GATE,
+    LLM_KV_NUH_FFN_HIDDEN,
+    LLM_KV_NUH_TIE_EMBEDDINGS,
+    LLM_KV_NUH_HEAD_DIM,
 };
 
 struct LLM_KV {
@@ -458,6 +469,19 @@ enum llm_tensor {
     LLM_TENSOR_MHC_MERGE_ALPHA,
     LLM_TENSOR_MHC_MERGE_BETA,
     LLM_TENSOR_MHC_MERGE_GAMMA,
+
+    // Nuh hybrid
+    LLM_TENSOR_NUH_KDA_NORM,        // blocks.%d.mixer.norm_weight
+    LLM_TENSOR_NUH_DECAY,           // blocks.%d.mixer.decay_proj
+    LLM_TENSOR_NUH_A_DIAG,          // blocks.%d.mixer.A_diag
+    LLM_TENSOR_NUH_P,               // blocks.%d.mixer.P
+    LLM_TENSOR_NUH_Q,               // blocks.%d.mixer.Q
+    LLM_TENSOR_NUH_SURPRISE,        // blocks.%d.mixer.surprise_proj
+    LLM_TENSOR_NUH_SURPRISE_ENERGY, // blocks.%d.mixer.surprise_energy
+    LLM_TENSOR_NUH_KV_A,            // blocks.%d.mixer.kv_a
+    LLM_TENSOR_NUH_KV_B_K,          // blocks.%d.mixer.kv_b_k
+    LLM_TENSOR_NUH_KV_B_V,          // blocks.%d.mixer.kv_b_v
+    LLM_TENSOR_FFN_GATE_UP,         // blocks.%d.mlp.w12 (fused gate+up)
 
     LLM_TENSOR_UNKNOWN,
 };

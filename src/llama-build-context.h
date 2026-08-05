@@ -237,6 +237,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3next();
 
+    ggml_cgraph * build_nuh();
+
     ggml_cgraph * build_qwen35moe();
 
     ggml_cgraph * build_qwen35();

@@ -364,6 +364,15 @@ struct llama_layer {
     struct ggml_tensor * ssm_conv1d_b = nullptr;
     struct ggml_tensor * ssm_dt_b = nullptr;
 
+    // Nuh KDA extras
+    struct ggml_tensor * nuh_a_diag = nullptr;
+    struct ggml_tensor * nuh_p = nullptr;
+    struct ggml_tensor * nuh_q = nullptr;
+    struct ggml_tensor * nuh_surprise_proj = nullptr;
+    struct ggml_tensor * nuh_surprise_proj_b = nullptr;
+    struct ggml_tensor * nuh_surprise_energy = nullptr;
+    struct ggml_tensor * nuh_ffn_gate_up = nullptr; // fused w12 before view-split
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;

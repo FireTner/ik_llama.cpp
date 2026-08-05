@@ -82,6 +82,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_qwen35_tensors(const LLM_TN & tn);
 
+    bool create_nuh_tensors(const LLM_TN & tn);
+
     bool create_phi2_tensors(const LLM_TN & tn);
 
     bool create_phi3_tensors(const LLM_TN & tn);
@@ -1861,6 +1863,94 @@ bool create_tensors_helper::create_mimo2_tensors(const LLM_TN & tn) {
                     llama_model_loader::TENSOR_NOT_REQUIRED);
         }
     }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_nuh_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t kda_rank  = hparams.nuh_kda_rank;
+    const int64_t mla_rank  = hparams.nuh_mla_rank;
+    const int64_t conv_k    = hparams.ssm_d_conv;
+    const int64_t head_dim  = hparams.n_embd_head_k(0);
+    const bool surprise     = hparams.nuh_surprise_gate;
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    {
+        model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+        // Tied embeddings: lm_head omitted from GGUF when nuh.tie_embeddings
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab},
+                llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (model.output == nullptr) {
+            model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
+                    llama_model_loader::TENSOR_DUPLICATED);
+        }
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+        auto & layer = model.layers[i];
+
+        layer.ffn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+        // Fused SwiGLU w12 → view-split into gate / up
+        {
+            layer.nuh_ffn_gate_up = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_UP, "weight", i), {n_embd, 2 * n_ff});
+            layer.ffn_gate = ggml_view_2d(ctx_split, layer.nuh_ffn_gate_up, n_embd, n_ff,
+                    layer.nuh_ffn_gate_up->nb[1], 0);
+            ggml_format_name(layer.ffn_gate, "blocks.%d.mlp.w12.gate", i);
+            layer.ffn_up = ggml_view_2d(ctx_split, layer.nuh_ffn_gate_up, n_embd, n_ff,
+                    layer.nuh_ffn_gate_up->nb[1], n_ff * layer.nuh_ffn_gate_up->nb[1]);
+            ggml_format_name(layer.ffn_up, "blocks.%d.mlp.w12.up", i);
+            layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
+        }
+
+        if (hparams.is_recurrent(i)) {
+            // KDA layer
+            // norm_weight has no ".weight" suffix in GGUF
+            layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_KDA_NORM, i), {n_embd});
+
+            // GGUF stores PyTorch Conv1d as {K, 1, D}; reshape to {K, D} in graph
+            layer.ssm_conv1d = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D, "weight", i),
+                    {conv_k, 1, n_embd});
+
+            layer.ssm_in = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_IN, "weight", i),
+                    {n_embd, 3 * kda_rank});
+            layer.ssm_dt = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_DECAY, "weight", i),
+                    {n_embd, kda_rank});
+            layer.ssm_dt_b = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_DECAY, "bias", i),
+                    {kda_rank});
+            layer.nuh_a_diag = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_A_DIAG, i), {kda_rank});
+            layer.nuh_p = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_P, i), {4, kda_rank});
+            layer.nuh_q = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_Q, i), {4, kda_rank});
+            layer.ssm_out = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_OUT, "weight", i),
+                    {kda_rank, n_embd});
+
+            if (surprise) {
+                layer.nuh_surprise_proj = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_SURPRISE, "weight", i),
+                        {n_embd, kda_rank});
+                layer.nuh_surprise_proj_b = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_SURPRISE, "bias", i),
+                        {kda_rank});
+                layer.nuh_surprise_energy = create_tensor(ctx_layer, tn(LLM_TENSOR_NUH_SURPRISE_ENERGY, i), {1});
+            }
+        } else {
+            // MLA layer
+            layer.attn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q, "weight", i),
+                    {n_embd, n_head * head_dim});
+            layer.wkv_a_mqa = create_tensor(ctx_split, tn(LLM_TENSOR_NUH_KV_A, "weight", i),
+                    {n_embd, mla_rank});
+            layer.wk_b = create_tensor(ctx_split, tn(LLM_TENSOR_NUH_KV_B_K, "weight", i),
+                    {mla_rank, n_head_kv * head_dim});
+            layer.wv_b = create_tensor(ctx_split, tn(LLM_TENSOR_NUH_KV_B_V, "weight", i),
+                    {mla_rank, n_head_kv * head_dim});
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i),
+                    {n_embd, n_embd});
+        }
+    }
+
     return use_mmap_buffer;
 }
 
@@ -4932,6 +5022,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_mellum_tensors(tn); break;
         case LLM_ARCH_QWEN3NEXT:
             use_mmap_buffer = create_qwen3next_tensors(tn); break;
+        case LLM_ARCH_NUH:
+            use_mmap_buffer = create_nuh_tensors(tn); break;
         case LLM_ARCH_QWEN35MOE:
             use_mmap_buffer = create_qwen35moe_tensors(tn); break;
         case LLM_ARCH_QWEN35:

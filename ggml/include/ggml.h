@@ -672,6 +672,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
+        GGML_OP_KDA_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
         GGML_OP_GET_REL_POS,
@@ -2583,6 +2584,20 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
+            struct ggml_tensor  * sq);
+
+    // Elementwise linear recurrence for Nuh KDA:
+    //   s_t = decay_t * s_{t-1} + write_t
+    // s:     [R, n_kv] F32
+    // decay: [R, n_tokens] F32
+    // write: [R, n_tokens] F32
+    // sq:    [n_kv, n_tokens] I32 (ssm_conv-style seq map)
+    // result: 1d F32 [states_out (R*n_tokens) | new_s (R*n_kv)]
+    GGML_API struct ggml_tensor * ggml_kda_scan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * decay,
+            struct ggml_tensor  * write,
             struct ggml_tensor  * sq);
 
     // partition into non-overlapping windows with padding if needed

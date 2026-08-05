@@ -95,6 +95,13 @@ struct llama_hparams {
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
 
+    // Nuh hybrid (KDA + MLA). When nuh_kda_rank > 0, recurrent state packs
+    // conv_hist ((conv_kernel-1)*d_model) + KDA state (kda_rank) into s_l.
+    uint32_t nuh_kda_rank       = 0;
+    uint32_t nuh_mla_rank       = 0;
+    uint32_t nuh_mla_every      = 4;
+    bool     nuh_surprise_gate  = true;
+
     // for hybrid state-space models (e.g. qwen3next)
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 
@@ -337,8 +344,8 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_k_s() const { // dimension of the rolling state embeddings
-        if (ssm_n_group > 0) {
-            // qwen3next keeps all recurrent state in the V-cache tail
+        if (ssm_n_group > 0 || nuh_kda_rank > 0) {
+            // qwen3next / nuh keep all recurrent state in the V-cache / s_l tail
             return 0;
         }
         // corresponds to Mamba's conv_states size
@@ -348,6 +355,11 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_v_s() const { // dimension of the recurrent state embeddings
+        if (nuh_kda_rank > 0) {
+            // Nuh KDA: [conv_hist ((K-1)*D) | s (R)]
+            const uint32_t conv_state_dim = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * ssm_d_inner;
+            return conv_state_dim + nuh_kda_rank;
+        }
         if (ssm_n_group > 0) {
             // qwen3next recurrent state packs:
             // 1) conv state: (d_conv - 1) * (2 * key_dim + value_dim)
