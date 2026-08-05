@@ -222,7 +222,6 @@ static __global__ void k_concat_dim0(int ne0, int ne00, int ne2,
     }
 }
 
-
 void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -287,7 +286,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         auto ne00_eff = (src0->ne[0]/bs)*ts/sizeof(float);
         auto ne0_eff  = (dst->ne[0]/bs)*ts/sizeof(float);
         if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-            //printf("%s(%s): using dim0 contiguous float version with ne3 = %ld\n", __func__, dst->name, dst->ne[3]);
             //if (dst->ne[1] >= 65536 || dst->ne[2] >= 65536) {
             //    fprintf(stderr, "%s: ne1 = %ld, ne2 = %ld exceed max. blocks when computing %s\n", __func__, dst->ne[1], dst->ne[2], dst->name);
             //    GGML_ABORT("fatal error");
@@ -312,7 +310,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             //printf("%s(not contiguous): %s(%s) and %s(%s)\n", __func__, src0->name, ggml_type_name(src0->type), src1->name, ggml_type_name(src1->type));
             auto ne10_eff = (src1->ne[0]/bs)*ts/sizeof(float);
             dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
-            //printf("%s(%s): using dim0 non-contiguous float version\n", __func__, dst->name);
             concat_f32_non_cont<<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                     (const char *)src0->data,
                     (const char *)src1->data,
@@ -335,7 +332,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && dim == 2 && dst->ne[3] > 1 && src1->ne[2] == 1) {
-        //printf("%s(%s): using contiguous dim2 float\n", __func__, dst->name);
         float * dst_d  = (float *)dst->data;
         float * src0_d = (float *)src0->data;
         float * src1_d = (float *)src1->data;
@@ -344,7 +340,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        printf("%s(%s): using generic contiguous dim2 float\n", __func__, dst->name);
         //if (dst->ne[1] >= 65536 || dst->ne[2] >= 65536) {
         //    fprintf(stderr, "%s: ne1 = %ld, ne2 = %ld exceed max. blocks when computing %s\n", __func__, dst->ne[1], dst->ne[2], dst->name);
         //    GGML_ABORT("fatal error");
@@ -363,7 +358,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
         }
     } else {
-        printf("%s(%s): using generic non-contiguous dim2 float\n", __func__, dst->name);
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         concat_f32_non_cont<<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *)src0->data,
